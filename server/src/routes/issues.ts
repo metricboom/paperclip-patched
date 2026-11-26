@@ -107,6 +107,7 @@ import {
   projectWorkspaces,
   projectAccessMembers,
   projects,
+  runIdentityContexts,
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
@@ -349,6 +350,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
+  repairCompanyDefaultIdentityRoot,
   type IssuePostCommitAction,
 } from "../services/issues.js";
 import {
@@ -854,6 +856,30 @@ async function sanitizeIssueCreateAttribution<T extends object>(
 
   delete sanitized.responsibleUserId;
   return sanitized;
+}
+
+/**
+ * True when the calling agent execution's accepted identity context records a
+ * `company_default` cause, meaning its responsible user is the company fallback
+ * rather than an attribution. Read from the context row in the caller's company
+ * so the authentication middleware does not have to carry the cause.
+ */
+async function actorIdentityIsCompanyDefault(
+  db: Db,
+  req: Request,
+  companyId: string,
+): Promise<boolean> {
+  if (req.actor.type !== "agent" || !req.actor.identityContextId) return false;
+  const [context] = await db
+    .select({ cause: runIdentityContexts.cause })
+    .from(runIdentityContexts)
+    .where(
+      and(
+        eq(runIdentityContexts.id, req.actor.identityContextId),
+        eq(runIdentityContexts.companyId, companyId),
+      ),
+    );
+  return context?.cause === "company_default";
 }
 
 function authenticatedActorResponsibleUserId(req: Request) {
@@ -13461,6 +13487,18 @@ export function issueRoutes(
       );
       let deduplicationReason: "idempotency_key" | "recent_open_title" | null =
         null;
+      // A company-default execution has no human to attribute the new task to.
+      // Stamping its context as the origin would make the fallback the task's
+      // permanent identity root, and passing its responsible user would record
+      // that fallback as the task's settled attribution. Both are inherited by
+      // every later execution, so neither is propagated: the new task starts
+      // without a root and the next execution resolves its own, falling back to
+      // company default again if there is still nobody to attribute it to.
+      const originIsCompanyDefault = await actorIdentityIsCompanyDefault(
+        db,
+        req,
+        companyId,
+      );
       const createInput = {
         ...createBody,
         workspaceSelectionActor: req.actor,
@@ -13468,13 +13506,16 @@ export function issueRoutes(
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
         originRunId: createBody.originRunId ?? actor.runId,
-        originIdentityContextId: req.actor.identityContextId ?? null,
+        originIdentityContextId: originIsCompanyDefault
+          ? null
+          : (req.actor.identityContextId ?? null),
         executionPolicy,
         ...(sourceTrust ? { sourceTrust } : {}),
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
+        actorIdentityIsCompanyDefault: originIsCompanyDefault,
         trustExplicitResponsibleUserId: actor.actorType === "user",
         watchdogActorRunId: actor.runId,
         assertCanReuseIssue: (existing: typeof issueRows.$inferSelect) => assertCanReuseCreatedIssue(req, existing),
@@ -17565,6 +17606,50 @@ export function issueRoutes(
         prevExecutionRunId: result.previous.executionRunId,
         clearAssignee,
       },
+    });
+
+    res.json(result);
+  });
+
+  // Board-only: detaching a task from a company-default identity root changes
+  // which executions can resolve a managed credential, so a person has to ask
+  // for it. An agent cannot repair the boundary its own executions are held by.
+  router.post("/issues/:id/admin/repair-identity-root", async (req, res) => {
+    assertBoard(req);
+    if (!req.actor.userId) {
+      throw forbidden("Board user context required");
+    }
+
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      svc.getById(id),
+      "Issue not found",
+    );
+    if (!existing) return;
+
+    const result = await repairCompanyDefaultIdentityRoot(db, {
+      companyId: existing.companyId,
+      issueId: existing.id,
+    });
+    if (!result) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.admin_repair_identity_root",
+      entityType: "issue",
+      entityId: existing.id,
+      details: { ...result, actorUserId: req.actor.userId },
     });
 
     res.json(result);

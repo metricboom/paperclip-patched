@@ -137,6 +137,7 @@ import {
   issueWorkProducts,
   issueReadStates,
   issueThreadInteractions,
+  runIdentityContexts,
   toolActionRequests,
   toolActionDeliveries,
   toolInvocations,
@@ -331,6 +332,147 @@ export type IssuePostCommitAction = {
   issueStatus: string;
 };
 
+/**
+ * Detach a task from a `company_default` identity root.
+ *
+ * A `company_default` cause is inherited by every later execution, so a task
+ * rooted in one can never resolve a managed credential however it is woken: the
+ * boundary outlives the fallback that caused it, and nothing the task does can
+ * shed it. This clears the task's pointers into the tainted lineage rather than
+ * rewriting that lineage. The contexts stay in `run_identity_contexts` exactly
+ * as recorded; the task simply stops descending from them, which is the shape
+ * a task created outside a company-default execution already has.
+ *
+ * Detaching grants nothing on its own. The next execution resolves its own
+ * identity from its own seed, and if there is still nobody to attribute it to it
+ * reaches the company fallback again, with a fresh root instead of an inherited
+ * one. What this removes is the permanence, not the boundary.
+ *
+ * A responsible user copied off a tainted context is cleared with it: that value
+ * is the fallback the execution was handed, and left in place the next seed
+ * reads it back off the task as settled human responsibility under a clean
+ * cause. Clearing it can only cost a re-resolution, which is the safe direction.
+ *
+ * Safe to re-run; a task with no tainted pointers reports no changes. Returns
+ * null when the task does not exist in the given company.
+ */
+export async function repairCompanyDefaultIdentityRoot(
+  db: Db,
+  input: { companyId: string; issueId: string },
+) {
+  return db.transaction(async (tx) => {
+    const [issue] = await tx
+      .select({
+        id: issues.id,
+        responsibleUserId: issues.responsibleUserId,
+        originIdentityContextId: issues.originIdentityContextId,
+        continuationIdentityContextId: issues.continuationIdentityContextId,
+      })
+      .from(issues)
+      .where(
+        and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)),
+      )
+      .for("update");
+    if (!issue) return null;
+    // An interaction's source context is consulted ahead of the task's own root,
+    // so a card raised by a tainted execution keeps feeding the taint into every
+    // run that answers it.
+    const interactions = await tx
+      .select({
+        id: issueThreadInteractions.id,
+        sourceIdentityContextId: issueThreadInteractions.sourceIdentityContextId,
+      })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, input.companyId),
+          eq(issueThreadInteractions.issueId, input.issueId),
+        ),
+      );
+    const referenced = [
+      ...new Set(
+        [
+          issue.originIdentityContextId,
+          issue.continuationIdentityContextId,
+          ...interactions.map((row) => row.sourceIdentityContextId),
+        ].filter((id): id is string => typeof id === "string" && !!id),
+      ),
+    ];
+    const taintedContexts = referenced.length
+      ? await tx
+          .select({
+            id: runIdentityContexts.id,
+            responsibleUserId: runIdentityContexts.responsibleUserId,
+          })
+          .from(runIdentityContexts)
+          .where(
+            and(
+              eq(runIdentityContexts.companyId, input.companyId),
+              eq(runIdentityContexts.cause, "company_default"),
+              inArray(runIdentityContexts.id, referenced),
+            ),
+          )
+      : [];
+    const tainted = new Set(taintedContexts.map((context) => context.id));
+    const taintedResponsibleUserIds = new Set(
+      taintedContexts
+        .map((context) => context.responsibleUserId)
+        .filter((id): id is string => typeof id === "string" && !!id),
+    );
+    const detachedOrigin =
+      !!issue.originIdentityContextId &&
+      tainted.has(issue.originIdentityContextId);
+    const detachedContinuation =
+      !!issue.continuationIdentityContextId &&
+      tainted.has(issue.continuationIdentityContextId);
+    const detachedInteractionIds = interactions
+      .filter(
+        (row) =>
+          row.sourceIdentityContextId &&
+          tainted.has(row.sourceIdentityContextId),
+      )
+      .map((row) => row.id);
+    const clearedResponsibleUserId =
+      !!issue.responsibleUserId &&
+      taintedResponsibleUserIds.has(issue.responsibleUserId);
+    if (detachedOrigin || detachedContinuation || clearedResponsibleUserId)
+      await tx
+        .update(issues)
+        .set({
+          ...(detachedOrigin ? { originIdentityContextId: null } : {}),
+          ...(detachedContinuation
+            ? { continuationIdentityContextId: null }
+            : {}),
+          ...(clearedResponsibleUserId ? { responsibleUserId: null } : {}),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(issues.id, input.issueId),
+            eq(issues.companyId, input.companyId),
+          ),
+        );
+    if (detachedInteractionIds.length)
+      await tx
+        .update(issueThreadInteractions)
+        .set({ sourceIdentityContextId: null })
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, input.companyId),
+            inArray(issueThreadInteractions.id, detachedInteractionIds),
+          ),
+        );
+    return {
+      issueId: input.issueId,
+      detachedOrigin,
+      detachedContinuation,
+      detachedInteractionIds,
+      clearedResponsibleUserId,
+      detachedContextIds: [...tainted],
+    };
+  });
+}
+
 /** Execute side effects that must never run before the issue transaction commits. */
 export async function executeIssuePostCommitActions(
   db: Db,
@@ -472,6 +614,7 @@ async function resolveResponsibleUserIdForIssueCreate(
     originRunId?: string | null;
     actorRunId?: string | null;
     actorResponsibleUserId?: string | null;
+    actorIdentityIsCompanyDefault?: boolean;
     trustExplicitResponsibleUserId?: boolean;
   },
 ) {
@@ -499,13 +642,16 @@ async function resolveResponsibleUserIdForIssueCreate(
     if (routineRun?.responsibleUserId) return routineRun.responsibleUserId;
   }
 
-  const actorResponsibleUserId = readStringFromRecord(
-    input,
-    "actorResponsibleUserId",
-  );
+  // A company-default responsible user is the fallback the creating execution
+  // was given because nobody could be attributed, so it is not an attribution to
+  // copy onto a new task. Recording it would make the next execution read it
+  // back as settled human responsibility and resolve a clean cause for it.
+  const actorResponsibleUserId = input.actorIdentityIsCompanyDefault
+    ? null
+    : readStringFromRecord(input, "actorResponsibleUserId");
   if (actorResponsibleUserId) return actorResponsibleUserId;
 
-  if (input.actorRunId) {
+  if (input.actorRunId && !input.actorIdentityIsCompanyDefault) {
     const actorRun = await reader
       .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
       .from(heartbeatRuns)
@@ -2085,6 +2231,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   watchdogActorRunId?: string | null;
   actorRunId?: string | null;
   actorResponsibleUserId?: string | null;
+  actorIdentityIsCompanyDefault?: boolean;
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
@@ -10192,6 +10339,8 @@ export function issueService(db: Db) {
                 : undefined),
         goalId: issueData.goalId ?? parent.goalId,
         actorResponsibleUserId: issueData.actorResponsibleUserId ?? null,
+        actorIdentityIsCompanyDefault:
+          issueData.actorIdentityIsCompanyDefault === true,
         trustExplicitResponsibleUserId:
           issueData.trustExplicitResponsibleUserId === true,
         requestDepth: clampIssueRequestDepth(
@@ -10643,6 +10792,7 @@ export function issueService(db: Db) {
         watchdogActorRunId,
         actorRunId,
         actorResponsibleUserId,
+        actorIdentityIsCompanyDefault,
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
@@ -11116,6 +11266,8 @@ export function issueService(db: Db) {
             originRunId: issueData.originRunId ?? null,
             actorRunId: actorRunId ?? null,
             actorResponsibleUserId: actorResponsibleUserId ?? null,
+            actorIdentityIsCompanyDefault:
+              actorIdentityIsCompanyDefault === true,
             trustExplicitResponsibleUserId:
               trustExplicitResponsibleUserId === true,
           },

@@ -19,6 +19,7 @@ import {
   issues,
   routines,
   routineRuns,
+  runIdentityContexts,
 } from "@paperclipai/db";
 import { createRoutineSchema } from "@paperclipai/shared";
 import {
@@ -581,6 +582,49 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     const completed = await waitForRun(db, run!.id);
     expect(completed?.responsibleUserId).toBe(ownerUserId);
     expect(completed?.responsibleUserId).not.toBe(creatorUserId);
+  });
+
+  it("does not promote a company-default responsible user onto the task it runs", async () => {
+    const { companyId, agentId, ownerUserId } = await seedCompany();
+    const parentUserId = `parent-${randomUUID()}`;
+    await db.insert(authUsers).values({ id: parentUserId, name: "Parent owner", email: `${parentUserId}@example.test`,
+      createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: parentUserId,
+      membershipRole: "member", status: "active" });
+    const parentId = randomUUID(), fallbackIssueId = randomUUID(), attributedIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Attributed parent", status: "backlog", responsibleUserId: parentUserId },
+      { id: fallbackIssueId, companyId, title: "Nobody to attribute", status: "todo", assigneeAgentId: agentId },
+      { id: attributedIssueId, companyId, title: "Attributed through parent", status: "todo", assigneeAgentId: agentId, parentId },
+    ]);
+    const runOn = async (issueId: string) => {
+      const run = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: { issueId },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_blockers_resolved" },
+      });
+      expect(run).not.toBeNull();
+      const completed = await waitForRun(db, run!.id);
+      const [context] = await db.select().from(runIdentityContexts)
+        .where(eq(runIdentityContexts.id, completed!.activeIdentityContextId!));
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      return { completed: completed!, context: context!, task: task! };
+    };
+
+    const fallback = await runOn(fallbackIssueId);
+    expect(fallback.completed.responsibleUserId).toBe(ownerUserId);
+    expect(fallback.context.cause).toBe("company_default");
+    expect(fallback.task.responsibleUserId).toBeNull();
+
+    // Control: an attributable run still settles its user onto the task.
+    const attributed = await runOn(attributedIssueId);
+    expect(attributed.completed.responsibleUserId).toBe(parentUserId);
+    expect(attributed.context.cause).not.toBe("company_default");
+    expect(attributed.task.responsibleUserId).toBe(parentUserId);
   });
 
   it("fails automated issue dispatch instead of falling back to the issue creator when no default exists", async () => {
