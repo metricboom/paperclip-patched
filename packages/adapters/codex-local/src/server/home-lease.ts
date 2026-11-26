@@ -20,6 +20,11 @@ import path from "node:path";
  * Either cleanup sees the run's lease and backs off, or the run sees the claim and waits. A
  * run's lease is never inside a home that cleanup detaches. The claim is held only for a few
  * stat, readdir and rename calls, never for the delete.
+ *
+ * Claims fail closed: a claim is never stolen. If the owner process of a claim is gone, the
+ * claim stays in place and is logged, and the home is skipped - a stale observer that still
+ * sees a dead claim must never rename away a live replacement claim. Leftover dead claims are
+ * removed by the stopgap prune cron until MET-495 lands.
  */
 
 export const RUN_LEASE_FILE = ".paperclip-run-lease";
@@ -80,12 +85,6 @@ async function readClaim(claimPath: string): Promise<ClaimState> {
   }
 }
 
-/** Remove a claim whose owner process is gone. The rename means only one stealer wins. */
-async function stealDeadClaim(claimPath: string): Promise<void> {
-  const aside = `${claimPath}.dead-${randomUUID()}`;
-  if (await fs.rename(claimPath, aside).then(() => true, () => false)) await fs.rm(aside, { force: true }).catch(() => {});
-}
-
 /**
  * Mark `home` as in use by this process. Returns a release function that removes only this
  * lease. Call before the home is seeded. Throws if the lease cannot be established; never
@@ -97,6 +96,7 @@ export async function acquireRunLease(home: string, now = Date.now()): Promise<(
   const claimPath = claimPathFor(home);
   const deadline = Date.now() + CLAIM_WAIT_MS;
   const release = async () => { await fs.rm(leasePath, { force: true }).catch(() => {}); };
+  let loggedDeadClaim = false;
   for (;;) {
     try {
       await fs.mkdir(leaseDir, { recursive: true });
@@ -106,8 +106,9 @@ export async function acquireRunLease(home: string, now = Date.now()): Promise<(
         // The lease must still be in the live home: a rename that landed between our write and
         // the claim check would have carried it into a detached copy.
         if (await fs.access(leasePath).then(() => true, () => false)) return release;
-      } else if (claim === "dead") {
-        await stealDeadClaim(claimPath);
+      } else if (claim === "dead" && !loggedDeadClaim) {
+        loggedDeadClaim = true;
+        console.warn(`[home-lease] cleanup claim ${claimPath} has a dead owner; leaving it in place and waiting`);
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -123,21 +124,24 @@ export async function acquireRunLease(home: string, now = Date.now()): Promise<(
 
 export type HomeClaim = { release: () => Promise<void> };
 
-/** Take the cleanup claim for `home`, or return null when another live cleaner holds it. */
+/**
+ * Take the cleanup claim for `home`, or return null when a claim file already exists. Fail
+ * closed: a live claim means another cleaner holds the home, and a dead one stays in place
+ * (logged) until the stopgap prune removes it - it is never stolen or replaced here.
+ */
 export async function claimHome(home: string): Promise<HomeClaim | null> {
   const claimPath = claimPathFor(home);
   const staging = `${claimPath}.new-${randomUUID()}`;
   await fs.writeFile(staging, JSON.stringify({ pid: process.pid, startedAt: Date.now() }), { mode: 0o600 });
   try {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      // link() is atomic and exclusive, and the claim appears with its owner already inside.
-      const created = await fs.link(staging, claimPath).then(() => true, (error: NodeJS.ErrnoException) => {
-        if (error.code === "EEXIST") return false;
-        throw error;
-      });
-      if (created) return { release: async () => { await fs.rm(claimPath, { force: true }).catch(() => {}); } };
-      if ((await readClaim(claimPath)) !== "dead") return null;
-      await stealDeadClaim(claimPath);
+    // link() is atomic and exclusive, and the claim appears with its owner already inside.
+    const created = await fs.link(staging, claimPath).then(() => true, (error: NodeJS.ErrnoException) => {
+      if (error.code === "EEXIST") return false;
+      throw error;
+    });
+    if (created) return { release: async () => { await fs.rm(claimPath, { force: true }).catch(() => {}); } };
+    if ((await readClaim(claimPath)) === "dead") {
+      console.warn(`[home-lease] cleanup claim ${claimPath} has a dead owner; leaving it in place and skipping the home`);
     }
     return null;
   } finally {

@@ -101,16 +101,19 @@ describe("cleanupGeneratedCodexHomes", () => {
     expect(await exists(path.join(racing, "state.sqlite"))).toBe(true);
   });
 
-  it("skips a home another live cleaner has claimed, and steals a claim whose owner is dead", async () => {
+  it("skips a home another live cleaner has claimed, and leaves a dead claim in place without recovering the home", async () => {
     await makeHome("b".repeat(64), HOUR);
     const target = await makeHome("c".repeat(64), 30 * DAY);
     const claimPath = path.join(agentDir, `.claim-${path.basename(target)}`);
     await fs.writeFile(claimPath, JSON.stringify({ pid: process.pid, startedAt: now }));
     expect((await run()).removedHomes).toEqual([]);
     expect(await exists(target)).toBe(true);
-    await fs.writeFile(claimPath, JSON.stringify({ pid: 2 ** 22 + 54321, startedAt: now }));
-    expect((await run()).removedHomes).toEqual([target]);
-    expect(await exists(claimPath)).toBe(false);
+    // Fail closed: a claim whose owner died is never stolen or replaced; the home is skipped.
+    const deadClaim = JSON.stringify({ pid: 2 ** 22 + 54321, startedAt: now });
+    await fs.writeFile(claimPath, deadClaim);
+    expect((await run()).removedHomes).toEqual([]);
+    expect(await exists(target)).toBe(true);
+    await expect(fs.readFile(claimPath, "utf8")).resolves.toBe(deadClaim);
   });
 
   it("only sweeps detached leftovers, never a live home, even a leased or recently active one", async () => {
