@@ -517,7 +517,7 @@ describe("buildSentryInitOptions", () => {
     expect(names).not.toContain("ContextLines");
   });
 
-  it("the resolved server integration list keeps OnUncaughtException, OnUnhandledRejection, LinkedErrors, and RequestData", async () => {
+  it("the resolved server integration list keeps OnUnhandledRejection, LinkedErrors, and RequestData, and leaves uncaught exceptions to the transport-error guard", async () => {
     const { buildSentryInitOptions } = await importFreshSentry();
 
     const options = buildSentryInitOptions("https://public@o0.ingest.sentry.io/1", {
@@ -527,11 +527,12 @@ describe("buildSentryInitOptions", () => {
     const resolved = options.integrations(DEFAULT_INTEGRATION_NAMES.map((name) => ({ name })));
     const names = resolved.map((i) => i.name);
 
-    // The full error-capture set the plan requires, not just the four named
-    // in this test's title.
+    // The full error-capture set the plan requires, not just the ones named
+    // in this test's title. Uncaught exceptions are captured and exited by
+    // transport-error-guard.ts instead of the SDK integration.
+    expect(names).not.toContain("OnUncaughtException");
     expect(names).toEqual(
       expect.arrayContaining([
-        "OnUncaughtException",
         "OnUnhandledRejection",
         "ChildProcess",
         "LinkedErrors",

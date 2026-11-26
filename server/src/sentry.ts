@@ -59,6 +59,14 @@
 // `mode: "strict"`: Sentry still captures the event, then exits the process,
 // so the existing crash-and-restart behavior stays.
 //
+// The SDK's `OnUncaughtException` integration is dropped. Once any other
+// `uncaughtException` listener exists it stops exiting the process, and it
+// reports only the first uncaught exception it sees. The server registers
+// its own listener (`transport-error-guard.ts`), which survives a closed
+// socket and nothing else, so that listener owns the decision outright: it
+// reports every uncaught exception through `captureException`, then either
+// keeps serving (a closed connection) or flushes and exits (anything else).
+//
 // `beforeSend` adds run navigation links, then bounded provenance for the
 // dynamic-import-callback error — see `sentry-dynamic-import-provenance.ts`.
 //
@@ -520,6 +528,7 @@ export function buildSentryInitOptions(
           integration.name !== "Console" &&
           integration.name !== "ContextLines" &&
           integration.name !== "Http" &&
+          integration.name !== "OnUncaughtException" &&
           integration.name !== "OnUnhandledRejection",
       );
       return [

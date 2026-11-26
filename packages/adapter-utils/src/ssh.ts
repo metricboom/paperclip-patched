@@ -711,6 +711,40 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
   }
 }
 
+// Error codes a pipe raises when its peer has gone away. `write EPIPE` on a
+// child's stdin means the child closed it (usually by exiting) while we were
+// still piping into it.
+const PIPE_TRANSPORT_ERROR_CODES = new Set([
+  "EPIPE",
+  "ECONNRESET",
+  "ERR_STREAM_DESTROYED",
+  "ERR_STREAM_PREMATURE_CLOSE",
+]);
+
+function isPipeTransportError(error: unknown): error is NodeJS.ErrnoException {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && PIPE_TRANSPORT_ERROR_CODES.has(code);
+}
+
+/**
+ * Attach an `error` listener to every stdio pipe a child exposes. A pipe
+ * `error` with no listener becomes an uncaught exception that takes the whole
+ * server down, so every child whose pipes we read or write must be guarded.
+ * `Readable.pipe` does not forward destination errors to the source, so this
+ * listener is the only thing that sees a broken stdin.
+ */
+function guardChildPipes(
+  child: { stdin?: NodeJS.WritableStream | null; stdout?: NodeJS.ReadableStream | null; stderr?: NodeJS.ReadableStream | null },
+  onError: (error: Error) => void,
+): void {
+  for (const pipe of [child.stdin, child.stdout, child.stderr]) pipe?.on("error", onError);
+}
+
+/** A process-exit failure that keeps the broken pipe (if any) as its transport cause. */
+function exitFailure(message: string, pipeError: Error | null): Error {
+  return pipeError ? new Error(message, { cause: pipeError }) : new Error(message);
+}
+
 async function streamLocalFileToSsh(input: {
   spec: SshConnectionConfig;
   localFile: string;
@@ -736,6 +770,7 @@ async function streamLocalFileToSsh(input: {
 
     let sshStderr = "";
     let settled = false;
+    let pipeError: Error | null = null;
 
     const fail = (error: Error) => {
       if (settled) return;
@@ -747,13 +782,27 @@ async function streamLocalFileToSsh(input: {
 
     if (input.timeoutMs) timer = setTimeout(() => fail(new Error("SSH archive upload timed out")), input.timeoutMs);
 
+    // ssh closed its end early. Stop feeding it and let its exit decide the
+    // result, so the error keeps ssh's own diagnostic on stderr.
+    guardChildPipes(ssh, (error) => {
+      if (!isPipeTransportError(error)) {
+        fail(error);
+        return;
+      }
+      pipeError ??= error;
+      source.destroy();
+      input.progress?.counter.destroy();
+    });
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
     source.on("error", fail);
     ssh.on("error", fail);
     if (input.progress) {
-      input.progress.counter.on("error", fail);
+      input.progress.counter.on("error", (error) => {
+        if (pipeError) return;
+        fail(error);
+      });
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
     } else {
       source.pipe(ssh.stdin ?? null);
@@ -762,7 +811,12 @@ async function streamLocalFileToSsh(input: {
       if (settled) return;
       settled = true;
       if ((code ?? 0) !== 0) {
-        reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+        reject(exitFailure(sshStderr.trim() || `ssh exited with code ${code ?? -1}`, pipeError));
+        return;
+      }
+      if (pipeError) {
+        // ssh exited cleanly but did not take the whole upload.
+        reject(pipeError);
         return;
       }
       resolve();
@@ -830,6 +884,7 @@ async function streamSshToLocalFile(input: {
     } else {
       pipeline(ssh.stdout, sink, onStreamFinished);
     }
+    guardChildPipes(ssh, fail);
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
@@ -1545,18 +1600,25 @@ export async function syncDirectoryToSsh(input: {
     let sshExited = false;
     let tarExitCode: number | null = null;
     let sshExitCode: number | null = null;
+    let pipeError: Error | null = null;
 
     const maybeFinish = () => {
       if (settled || !tarExited || !sshExited) {
         return;
       }
       settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
+      // Once ssh has broken the pipe, we stopped tar ourselves, so tar's
+      // exit says nothing about the transfer. Report ssh's side instead.
+      if (!pipeError && (tarExitCode ?? 0) !== 0) {
         reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
       }
       if ((sshExitCode ?? 0) !== 0) {
-        reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
+        reject(exitFailure(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`, pipeError));
+        return;
+      }
+      if (pipeError) {
+        reject(pipeError);
         return;
       }
       resolve();
@@ -1572,8 +1634,25 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    // ssh closed its stdin early: stop tar (it would otherwise block forever
+    // on a full pipe) and let both exits settle the result.
+    const onSshPipeError = (error: Error) => {
+      if (!isPipeTransportError(error)) {
+        fail(error);
+        return;
+      }
+      pipeError ??= error;
+      progress?.counter.destroy();
+      tar.kill("SIGTERM");
+    };
+    guardChildPipes(ssh, onSshPipeError);
+    guardChildPipes(tar, fail);
+
     if (progress) {
-      progress.counter.on("error", fail);
+      progress.counter.on("error", (error) => {
+        if (pipeError) return;
+        fail(error);
+      });
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
     } else {
       tar.stdout?.pipe(ssh.stdin ?? null);
@@ -1660,16 +1739,23 @@ export async function syncDirectoryFromSsh(input: {
       let tarExited = false;
       let sshExitCode: number | null = null;
       let tarExitCode: number | null = null;
+      let pipeError: Error | null = null;
 
       const maybeFinish = () => {
         if (settled || !sshExited || !tarExited) return;
         settled = true;
-        if ((sshExitCode ?? 0) !== 0) {
+        // Once local tar has broken the pipe, we stopped ssh ourselves, so
+        // ssh's exit says nothing about the transfer. Report tar's side.
+        if (!pipeError && (sshExitCode ?? 0) !== 0) {
           reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
           return;
         }
         if ((tarExitCode ?? 0) !== 0) {
-          reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
+          reject(exitFailure(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`, pipeError));
+          return;
+        }
+        if (pipeError) {
+          reject(pipeError);
           return;
         }
         resolve();
@@ -1683,8 +1769,25 @@ export async function syncDirectoryFromSsh(input: {
         reject(error);
       };
 
+      // Local tar closed its stdin early: stop ssh (it would otherwise block
+      // forever on a full pipe) and let both exits settle the result.
+      const onTarPipeError = (error: Error) => {
+        if (!isPipeTransportError(error)) {
+          fail(error);
+          return;
+        }
+        pipeError ??= error;
+        progress?.counter.destroy();
+        ssh.kill("SIGTERM");
+      };
+      guardChildPipes(tar, onTarPipeError);
+      guardChildPipes(ssh, fail);
+
       if (progress) {
-        progress.counter.on("error", fail);
+        progress.counter.on("error", (error) => {
+          if (pipeError) return;
+          fail(error);
+        });
         ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);
       } else {
         ssh.stdout?.pipe(tar.stdin ?? null);

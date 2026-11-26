@@ -573,8 +573,14 @@ exact cleanup receipt, checkpoint, and absence of provider work.
 
 **Server events the default integrations add**
 
-- `OnUncaughtException` — each uncaught exception on the main thread, at
-  level `fatal`. The process still exits.
+- Uncaught exceptions — the SDK's `OnUncaughtException` integration is
+  removed. The server's transport-error guard (`server/src/transport-error-guard.ts`)
+  captures each uncaught exception on the main thread through
+  `captureException`, at the default `error` level. A peer-closed socket
+  error (`EPIPE` or `ECONNRESET` from a socket read or write, or
+  `ERR_STREAM_DESTROYED` / `ERR_STREAM_PREMATURE_CLOSE`) is then logged and
+  the server keeps running. Every other uncaught exception flushes Sentry
+  and exits the process with status 1, as before.
 - `OnUnhandledRejection` — each unhandled promise rejection. The mode is
   `strict`, so the process exits after the capture.
 - `ChildProcess` — one event for each worker-thread `error`.
