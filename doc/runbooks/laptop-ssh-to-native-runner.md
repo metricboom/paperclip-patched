@@ -2,6 +2,8 @@
 
 Scope: agents on one SSH execution environment (Laptop 1), currently `claude_local` (Ada, Finch) and `codex_local` (Chloe, Neo). Written against master `ff5e35dd`. Nothing here was run against a live server, the VPS, or a laptop. The operator runs every step.
 
+**Read this first: after the switch, an SSH run resumes from its checkpoint as a new launch. It is not reattached.** A server restart starts a new Runner process and a new provider attempt that resumes the saved session; the live process is not adopted. This is accepted as interim behaviour because it beats today's dead `legacy_execution_requires_reconciliation` runs. It does not meet the goal of a true reattach, which is a separate job (SSH reattach is not built). The pilot criteria in section 5 check for this resume behaviour.
+
 Placeholders: `$PC` (Paperclip base URL), `$AUTH` (a board credential header, kept in your shell; never paste its value into a ticket or log), `$AGENT_ID`, `$ENV_ID`, `$RUN_ID`, `$COMPANY_ID`.
 
 ## 0. Read this first: SSH is not restart-reattachable today
@@ -12,7 +14,7 @@ The goal of the move is that a server restart no longer kills a laptop run. The 
 - Restart classification only produces `reattach_remote_runner` for a run with a synced sandbox workspace (`nativeWorkspaceSync` / `remoteWorkspace`) or a plugin task. SSH runs have neither: `server/src/services/native-runtime/native-restart-recovery.ts` (`remoteSandbox`, `classifyNativeRunnerRecoveryEvidence`). From the code, an SSH run lands on the checkpoint path (`resume_dead_runner`: a new Runner launch that resumes the saved provider session, charged against 3 provider attempts) instead of adopting the live process. This reading is not proven by a test; the pilot in section 5 measures it.
 - Pinned by `server/src/services/native-runtime/remote-runner-ssh-reattach.test.ts`.
 
-What moving to the native runner does give on SSH: runs finish through the durable PRP outbox, and a restart goes to a bounded checkpoint resume rather than `legacy_execution_requires_reconciliation`. Whether that is enough is the operator's call. **Do not roll out past the pilot unless section 5 passes**, and expect the strict "same process reattached" criterion to fail on SSH until reattach is built for it.
+What moving to the native runner does give on SSH: runs finish through the durable PRP outbox, and a restart goes to a bounded checkpoint resume rather than `legacy_execution_requires_reconciliation`. Decision (tech lead): checkpoint resume is acceptable for now. **Do not roll out past the pilot unless section 5 passes.** Same-process reattach is not expected on SSH and is not a pass criterion.
 
 ## 1. Which route: adapter switch, not environment switch
 
@@ -60,12 +62,12 @@ Do these only when the agent has **no live run** (step 3.1 check).
 Pass (all of):
 - A throwaway task run on the pilot shows `runtimeMode: native` and finishes `succeeded` with the expected output.
 - After the restart check, the **same run id** continues and finishes (no new run id for the same wake), output continues in `GET $PC/api/heartbeat-runs/$RUN_ID/events` after the restart time, and no `issue_recovery_actions` row with cause `legacy_execution_requires_reconciliation` or `native_continuation_requires_reconciliation` exists for it.
-- Strict reattach evidence (section 6, step 6): `recovery_history` shows `reattach_remote_runner` and the `native.process_start_requested` event count for the run does not increase.
+- Checkpoint-resume evidence (section 6, step 7): `recovery_history` shows `resume_dead_runner`, a new `native.process_start_requested` event with a higher `providerAttempt`, and a new `paperclip-runnerd` PID on the laptop. This is the expected SSH outcome, not a failure.
 
 Stop and roll back (any of):
 - The run id changes, the run ends `failed`/`cancelled`, or a reconciliation cause above appears.
-- `native_remote_recovery_lease_mismatch` or `runner_remote_recovery_identity_mismatch` appears.
-- Disposition is `resume_dead_runner` (checkpoint resume, a new provider attempt). This is the outcome the code predicts for SSH (section 0). Treat it as a **fail of the strict criterion**: do not switch the other three; report the evidence and decide whether checkpoint resume is acceptable or SSH reattach must be built first.
+- `native_remote_recovery_lease_mismatch` surfaces as a run failure rather than falling through to checkpoint resume, or `runner_remote_recovery_identity_mismatch` appears.
+- The disposition is neither `resume_dead_runner` nor `reattach_remote_runner`. If it is `reattach_remote_runner`, report it: it contradicts section 0.
 - Two restarts in a row exhaust the 3-attempt budget (`execution_recovery_budget_exhausted`).
 
 ## 6. Staged restart check (operator decides when to restart the live server)
@@ -77,13 +79,13 @@ This step restarts the live Paperclip container. The operator chooses the time, 
 3. Record before-evidence (read-only): `GET $PC/api/heartbeat-runs/$RUN_ID` fields `id`, `status`, `runtimeMode`, `processPid`; and on the laptop `pgrep -af paperclip-runnerd` (note the PID and start time).
 4. **Restart the Paperclip container** (your orchestrator's restart command; the operator's call).
 5. After `GET $PC/api/health` is ready, poll `GET $PC/api/heartbeat-runs/$RUN_ID` and the events until the task finishes.
-6. Evidence that proves reattachment (all must hold):
-   - Same `id`, final `status: succeeded`, `errorCode` null.
-   - Events after T0 continue with `seq` above the recorded value, and the count of `native.process_start_requested` events for the run is unchanged.
-   - Laptop: the same `paperclip-runnerd` PID and start time as step 3.
-   - Read-only SQL: `select recovery_history from native_run_finalizations where run_id = '<RUN_ID>';` last entry has `disposition: reattach_remote_runner`; and `select cause from issue_recovery_actions where fingerprint like '%<RUN_ID>%';` returns no reconciliation cause.
-   - Server log lines (search by `$RUN_ID`) contain no `native_remote_recovery_lease_mismatch` or `runner_remote_recovery_identity_mismatch`.
-7. Evidence of checkpoint resume instead (fails the strict criterion): `disposition: resume_dead_runner`, a new `native.process_start_requested` event with a higher `providerAttempt`, and a new `paperclip-runnerd` PID on the laptop. If the old PID is still running too, kill nothing; report it.
+6. Evidence of checkpoint resume (the expected SSH outcome; all must hold):
+   - Same run id, final `status: succeeded`, `errorCode` null.
+   - Events after T0 continue with `seq` above the recorded value, and a new `native.process_start_requested` event with a higher `providerAttempt` appears.
+   - Laptop: a new `paperclip-runnerd` PID and start time, different from step 3. If the old PID is still running too, kill nothing; report it.
+   - Read-only SQL: `select recovery_history from native_run_finalizations where run_id = '<RUN_ID>';` last entry has `disposition: resume_dead_runner`; and `select cause from issue_recovery_actions where fingerprint like '%<RUN_ID>%';` returns no reconciliation cause.
+   - Server log lines (search by `$RUN_ID`) show no `runner_remote_recovery_identity_mismatch`.
+7. Evidence that would show a true reattach (not expected on SSH; report it if seen): `disposition: reattach_remote_runner`, an unchanged `native.process_start_requested` count, and the same `paperclip-runnerd` PID and start time as step 3.
 
 ## 7. Existing tests this relies on, and what they do not prove
 
