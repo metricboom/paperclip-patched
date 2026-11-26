@@ -59,6 +59,10 @@ describe("cleanupGeneratedCodexHomes", () => {
     await makeHome("b".repeat(64), HOUR);
     const dead = await makeHome("c".repeat(64), 30 * DAY);
     await fs.writeFile(path.join(dead, ".paperclip-run-lease"), JSON.stringify({ pid: 2 ** 22 + 12345, startedAt: now }));
+    // Writing the lease bumps the home's mtime; restore the idle age so the home is not "newest".
+    const idle = new Date(now - 30 * DAY);
+    await fs.utimes(path.join(dead, ".paperclip-run-lease"), idle, idle);
+    await fs.utimes(dead, idle, idle);
     await run();
     expect(await exists(dead)).toBe(false);
   });
