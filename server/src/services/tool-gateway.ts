@@ -1,4 +1,5 @@
 import { assertAgentToolAssignmentInteractions } from "./connection-management.js";
+import { isConnectionGrantAudienceAllowed, splitConnectionGrantAudience } from "./tool-access/grant-audience.js";
 import {
   AwsMcpCredentialError,
   isAwsMcpConnection,
@@ -330,17 +331,7 @@ export function resolveCredentialGrantKind(
   return policy === "per_user" ? "user_authorization_required" : "organization";
 }
 
-export function isConnectionGrantAudienceAllowed(
-  memberUserIds: string[],
-  actingUserId: string | null,
-  actingUserIsActiveMember: boolean,
-): boolean {
-  if (actingUserId !== null && !actingUserIsActiveMember) return false;
-  return (
-    memberUserIds.length === 0 ||
-    (actingUserId !== null && memberUserIds.includes(actingUserId))
-  );
-}
+export { isConnectionGrantAudienceAllowed };
 // When a human approves a parked write, the server carries it out on their
 // behalf with no interactive caller left to raise `timeoutMs`. Remote write
 // providers (e.g. Zapier Google Sheets `add_row`) routinely take longer than
@@ -5527,16 +5518,15 @@ export function createToolGatewayService(
           },
         );
       }
-      const members = await db
-        .select({ subjectId: connectionGrantMembers.subjectId })
+      const audience = splitConnectionGrantAudience(await db
+        .select({ subjectType: connectionGrantMembers.subjectType, subjectId: connectionGrantMembers.subjectId })
         .from(connectionGrantMembers)
         .where(
           and(
             eq(connectionGrantMembers.companyId, connection.companyId),
             eq(connectionGrantMembers.grantId, grant.id),
-            eq(connectionGrantMembers.subjectType, "user"),
           ),
-        );
+        ));
       const activeAudienceMember = actingUserId
         ? await db
             .select({ id: companyMemberships.id })
@@ -5554,19 +5544,23 @@ export function createToolGatewayService(
         : null;
       if (
         !isConnectionGrantAudienceAllowed(
-          members.map((member) => member.subjectId),
+          audience.memberUserIds,
           actingUserId,
           Boolean(activeAudienceMember),
+          { memberAgentIds: audience.memberAgentIds, actingAgentId: session.agentId ?? null },
         )
       ) {
         throw new ToolGatewayHttpError(
           403,
-          "The acting user is not in this grant's audience",
+          actingUserId
+            ? "The acting user is not in this grant's audience"
+            : "This agent is not in this grant's audience",
           "grant_audience_denied",
           {
             connectionId: connection.id,
             grantId: grant.id,
             actingUserId,
+            ...(actingUserId ? {} : { agentId: session.agentId ?? null }),
           },
         );
       }

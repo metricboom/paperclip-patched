@@ -2668,6 +2668,108 @@ rl.on("line", (line) => {
     expect(response.status).toBe(403);
   });
 
+  it("admits an agent run without an acting user only when its agent is an agent member of the grant audience", async () => {
+    const company = await createCompany(db);
+    const agentX = await createAgent(db, company.id);
+    const agentY = await createAgent(db, company.id);
+    const { run: runX } = await createIssueAndRun(db, company.id, agentX.id);
+    const { run: runY } = await createIssueAndRun(db, company.id, agentY.id);
+    await createActiveMember(db, company.id, "jamie");
+    const localTool = await createLocalStdioMcpTool(db, company.id, { applicationKey: `agent-audience-${randomUUID()}` });
+    await allowAllToolsForAgent(db, company.id, agentX.id);
+    await allowAllToolsForAgent(db, company.id, agentY.id);
+    const [organizationGrant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, localTool.connection.id),
+      eq(connectionGrants.kind, "organization"),
+    ));
+    await db.insert(connectionGrantMembers).values([
+      { companyId: company.id, grantId: organizationGrant!.id, subjectType: "user", subjectId: "jamie" },
+      { companyId: company.id, grantId: organizationGrant!.id, subjectType: "agent", subjectId: agentX.id },
+    ]);
+    const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 10_000 } });
+    const sessionX = await gateway.createSession({ companyId: company.id, agentId: agentX.id, runId: runX.id });
+    const sessionY = await gateway.createSession({ companyId: company.id, agentId: agentY.id, runId: runY.id });
+    const toolFor = async (token: string) =>
+      (await gateway.listToolsForSession(token)).find((item) => item.connectionId === localTool.connection.id)!;
+    const toolX = await toolFor(sessionX.token);
+    const toolY = await toolFor(sessionY.token);
+
+    // Agent X has no acting user and is an agent member: admitted.
+    const allowed = await gateway.executeTool({ sessionToken: sessionX.token, tool: toolX.name, parameters: { message: "x" } });
+    expect((allowed.result as { data?: { structuredContent?: { echoed?: string } } }).data?.structuredContent?.echoed).toBe("x");
+
+    // Agent Y has no acting user and is not an agent member: refused.
+    await expect(gateway.executeTool({ sessionToken: sessionY.token, tool: toolY.name, parameters: { message: "y" } }))
+      .rejects.toMatchObject({ status: 403, reasonCode: "grant_audience_denied" });
+
+    // A run with an acting user keeps the user check: Jamie is still admitted
+    // even on agent Y's run, because Jamie is a user member.
+    await db.update(heartbeatRuns).set({ responsibleUserId: "jamie" }).where(eq(heartbeatRuns.id, runY.id));
+    const asJamie = await gateway.executeTool({ sessionToken: sessionY.token, tool: toolY.name, parameters: { message: "j" } });
+    expect((asJamie.result as { data?: { structuredContent?: { echoed?: string } } }).data?.structuredContent?.echoed).toBe("j");
+
+    // An audience that holds only agents is not "all members": Jamie is refused
+    // once removed, and agent X still gets in without an acting user.
+    await db.delete(connectionGrantMembers).where(and(
+      eq(connectionGrantMembers.grantId, organizationGrant!.id),
+      eq(connectionGrantMembers.subjectType, "user"),
+    ));
+    await expect(gateway.executeTool({ sessionToken: sessionY.token, tool: toolY.name, parameters: { message: "j" } }))
+      .rejects.toMatchObject({ status: 403, reasonCode: "grant_audience_denied" });
+    await db.update(heartbeatRuns).set({ responsibleUserId: null }).where(eq(heartbeatRuns.id, runY.id));
+    await expect(gateway.executeTool({ sessionToken: sessionY.token, tool: toolY.name, parameters: { message: "y" } }))
+      .rejects.toMatchObject({ status: 403, reasonCode: "grant_audience_denied" });
+    const stillAllowed = await gateway.executeTool({ sessionToken: sessionX.token, tool: toolX.name, parameters: { message: "x2" } });
+    expect((stillAllowed.result as { data?: { structuredContent?: { echoed?: string } } }).data?.structuredContent?.echoed).toBe("x2");
+  });
+
+  it("keeps a connection installed only on one agent away from other agents, even with an explicit grant", async () => {
+    const company = await createCompany(db);
+    const agentX = await createAgent(db, company.id);
+    const agentY = await createAgent(db, company.id);
+    const { run: runX } = await createIssueAndRun(db, company.id, agentX.id);
+    const { run: runY } = await createIssueAndRun(db, company.id, agentY.id);
+    const localTool = await createLocalStdioMcpTool(db, company.id, { applicationKey: `agent-only-install-${randomUUID()}` });
+    await allowAllToolsForAgent(db, company.id, agentX.id);
+    await allowAllToolsForAgent(db, company.id, agentY.id);
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: localTool.connection.id,
+      targetType: "agent",
+      targetId: agentX.id,
+    });
+    // The explicit connection grant is what let other agents through before.
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agentY.id,
+      permissionKey: "tools:use",
+      scope: { allow: [`connection:${localTool.connection.id}`] },
+    });
+    const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 10_000 } });
+    const sessionX = await gateway.createSession({ companyId: company.id, agentId: agentX.id, runId: runX.id });
+    const sessionY = await gateway.createSession({ companyId: company.id, agentId: agentY.id, runId: runY.id });
+
+    const toolX = (await gateway.listToolsForSession(sessionX.token)).find((item) => item.connectionId === localTool.connection.id);
+    expect(toolX).toBeDefined();
+    expect((await gateway.listToolsForSession(sessionY.token)).some((item) => item.connectionId === localTool.connection.id))
+      .toBe(false);
+    await expect(gateway.executeTool({ sessionToken: sessionY.token, tool: toolX!.name, parameters: { message: "y" } }))
+      .rejects.toMatchObject({ reasonCode: "deny_connection_not_installed_for_agent" });
+
+    // A company install restores the usual behavior for agent Y.
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: localTool.connection.id,
+      targetType: "company",
+      targetId: company.id,
+    });
+    const toolY = (await gateway.listToolsForSession(sessionY.token)).find((item) => item.connectionId === localTool.connection.id);
+    expect(toolY).toBeDefined();
+    const allowed = await gateway.executeTool({ sessionToken: sessionY.token, tool: toolY!.name, parameters: { message: "y" } });
+    expect((allowed.result as { data?: { structuredContent?: { echoed?: string } } }).data?.structuredContent?.echoed).toBe("y");
+  });
+
   it("passes only the selected grant identity to local stdio MCP processes", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

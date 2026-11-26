@@ -287,7 +287,7 @@ export const connectionGrantMembers = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    check("connection_grant_members_subject_type_check", sql`${table.subjectType} in ('user')`),
+    check("connection_grant_members_subject_type_check", sql`${table.subjectType} in ('user', 'agent')`),
     foreignKey({
       columns: [table.companyId, table.grantId],
       foreignColumns: [connectionGrants.companyId, connectionGrants.id],

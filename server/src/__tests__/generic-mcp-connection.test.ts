@@ -3391,7 +3391,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await expect(policy.decide(decisionInput(writeEntry.id, "create_insight")))
       .resolves.toMatchObject({ allowed: false, reasonCode: "deny_default" });
     await expect(policy.decide(decisionInput(readEntry.id, "list_insights", outsideAgent!.id)))
-      .resolves.toMatchObject({ allowed: false, reasonCode: "deny_connection_not_installed" });
+      .resolves.toMatchObject({ allowed: false, reasonCode: "deny_connection_not_installed_for_agent" });
 
     // Simulate a profile written by the legacy install path. Saving installs
     // must self-heal this over-broad entry as well as avoiding it for new apps.
