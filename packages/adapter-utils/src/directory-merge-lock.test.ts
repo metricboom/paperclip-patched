@@ -107,6 +107,55 @@ describe("directory merge lock process lifetime", () => {
     await expect(withDirectoryMergeLock(target, async () => "released", env)).resolves.toBe("released");
   }, 15_000);
 
+  it("lets a second restore wait for a live holder that outlasts the stale window, then run after release", async () => {
+    const { target, env, lock } = await fixture();
+    const child = await holder(target, env);
+    const recordPath = `${lock}.owner.json`;
+    const acquiredMtime = (await stat(recordPath)).mtimeMs;
+    const staleAfterMs = 1_500;
+    const startedAt = Date.now();
+    let refreshedMtime = 0;
+    // The holder keeps working well past the stale window, then releases.
+    const release = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 4_000));
+      refreshedMtime = (await stat(recordPath)).mtimeMs;
+      const exited = once(child, "exit");
+      child.send("release");
+      await exited;
+    })();
+    await expect(withDirectoryMergeLock(target, async () => "second", env, undefined, { staleAfterMs, maxWaitMs: 20_000 }))
+      .resolves.toBe("second");
+    await release;
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(3_500);
+    // The holder showed it was alive while it worked.
+    expect(refreshedMtime).toBeGreaterThan(acquiredMtime);
+  }, 20_000);
+
+  it("still bounds a wait behind a live, refreshing holder", async () => {
+    const { target, env } = await fixture();
+    const child = await holder(target, env);
+    const contender = vi.fn();
+    const startedAt = Date.now();
+    await expect(withDirectoryMergeLock(target, contender, env, undefined, { staleAfterMs: 5_000, maxWaitMs: 1_500 }))
+      .rejects.toMatchObject({ code: WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_400);
+    expect(contender).not.toHaveBeenCalled();
+    const exited = once(child, "exit");
+    child.send("release");
+    await exited;
+  }, 15_000);
+
+  it("recovers a killed holder with the default wait", async () => {
+    const { target, env } = await fixture();
+    const child = await holder(target, env);
+    const exited = once(child, "exit");
+    child.kill("SIGKILL");
+    await exited;
+    const startedAt = Date.now();
+    await expect(withDirectoryMergeLock(target, async () => "restored", env)).resolves.toBe("restored");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 15_000);
+
   it("releases ownership when the protected operation throws", async () => {
     const { target, env } = await fixture();
     await expect(withDirectoryMergeLock(target, async () => { throw new Error("operation failed"); }, env)).rejects.toThrow("operation failed");

@@ -238,6 +238,20 @@ function directorySnapshotsMatch(left: DirectorySnapshot, right: DirectorySnapsh
 }
 
 const LOCK_WAIT_MS = 30_000;
+/** How often a holder touches its owner sidecar to show it is still working. */
+const LOCK_REFRESH_INTERVAL_MS = 1_000;
+/** Hard upper bound on one wait behind a holder that keeps refreshing. */
+const LOCK_MAX_WAIT_MS = 30 * 60 * 1000;
+
+/**
+ * How long a contender waits. A number is a fixed bound from the start of the
+ * wait (`0` means try once). The object form waits while the current holder
+ * keeps refreshing the lock: it gives up only when the holder has not refreshed
+ * for `staleAfterMs`, or after `maxWaitMs` in total. A crashed holder releases
+ * its SQLite lock at once, so neither bound is needed to recover from one.
+ */
+export type DirectoryMergeLockWait = number | { staleAfterMs: number; maxWaitMs: number };
+const DEFAULT_LOCK_WAIT: DirectoryMergeLockWait = { staleAfterMs: LOCK_WAIT_MS, maxWaitMs: LOCK_MAX_WAIT_MS };
 const LOCK_DIAGNOSTIC_READ_TIMEOUT_MS = 100;
 const activeDirectoryMergeLocks = new Set<string>();
 const MAX_LOCK_DIAGNOSTIC_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -381,13 +395,24 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
   }
 }
 
-async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryMergeLockOperation, waitMs: number = LOCK_WAIT_MS): Promise<() => Promise<void>> {
+async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryMergeLockOperation, wait: DirectoryMergeLockWait = DEFAULT_LOCK_WAIT): Promise<() => Promise<void>> {
   const startedAt = performance.now();
-  const deadline = Date.now() + waitMs;
+  const waitStartedAt = Date.now();
+  const followsHolder = typeof wait !== "number";
+  const hardDeadline = waitStartedAt + (followsHolder ? wait.maxWaitMs : wait);
+  let deadline = followsHolder ? Math.min(hardDeadline, waitStartedAt + wait.staleAfterMs) : hardDeadline;
   const databasePath = `${lockDir}.sqlite`;
   const ownerPath = `${lockDir}.owner.json`;
-  async function waitForLock(diagnosticOwnerPath: string) {
-    if (Date.now() >= deadline) {
+  // Only current SQLite holders refresh their sidecar; a legacy directory
+  // holder keeps the fixed bound.
+  async function waitForLock(diagnosticOwnerPath: string, holderRefreshes = false) {
+    // Read the clock once per step so the stale check and the timeout agree.
+    const now = Date.now();
+    if (now >= deadline && followsHolder && holderRefreshes) {
+      const refreshedAt = await fs.stat(diagnosticOwnerPath).then((stat) => stat.mtimeMs, () => null);
+      if (refreshedAt !== null) deadline = Math.min(hardDeadline, Math.max(deadline, refreshedAt + wait.staleAfterMs));
+    }
+    if (now >= deadline) {
       const timeoutError: NodeJS.ErrnoException & { workspaceRestoreLock?: Record<string, string | number | boolean> } = new Error(
         `Timed out waiting for workspace restore lock at ${lockDir}`,
       );
@@ -427,7 +452,7 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       } catch (error) {
         const code = (error as { errcode?: number }).errcode;
         if (typeof code !== "number" || (code & 0xff) !== 5) throw error; // SQLITE_BUSY
-        await waitForLock(ownerPath);
+        await waitForLock(ownerPath, true);
       }
     }
 
@@ -445,10 +470,18 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       await owner.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, "utf8");
     } finally { await owner.close(); }
     activeDirectoryMergeLocks.add(lockDir);
+    // Show waiters the holder is alive and still working. Best effort: a
+    // missed touch only shortens how long a contender keeps waiting.
+    const refresh = setInterval(() => {
+      const now = new Date();
+      void fs.utimes(ownerPath, now, now).catch(() => undefined);
+    }, LOCK_REFRESH_INTERVAL_MS);
+    refresh.unref();
     let released = false;
     return async () => {
       if (released) return;
       released = true;
+      clearInterval(refresh);
       try {
         // This sidecar is diagnostic only. A failed removal cannot retain
         // ownership, and the next holder replaces it while holding the DB lock.
@@ -539,7 +572,7 @@ export async function withDirectoryMergeLock<T>(
   diagnosticOperation?: DirectoryMergeLockOperation,
   // Test seam only: overrides how long acquisition waits before it reports a
   // timeout. Production callers must omit this and keep the real budget.
-  waitMs: number = LOCK_WAIT_MS,
+  waitMs: DirectoryMergeLockWait = DEFAULT_LOCK_WAIT,
 ): Promise<T> {
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
   // lock protect one directory while the caller mutates another.
@@ -586,7 +619,7 @@ async function withCanonicalDirectoryMergeLock<T>(
   fn: (canonicalTargetDir: string) => Promise<T>,
   env: NodeJS.ProcessEnv,
   diagnosticOperation?: DirectoryMergeLockOperation,
-  waitMs: number = LOCK_WAIT_MS,
+  waitMs: DirectoryMergeLockWait = DEFAULT_LOCK_WAIT,
 ): Promise<T> {
   const lockRoot = await resolveDirectoryMergeLockRoot(env);
   const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");

@@ -19,7 +19,7 @@ import {
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 
-import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { disposeDirectorySnapshot, mergeDirectoryWithBaseline, selectDirectorySnapshot } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -1684,6 +1684,19 @@ export async function syncDirectoryToSsh(input: {
   }
 }
 
+/**
+ * Agent runtimes (Claude Code, Codex) keep live state in these workspace-root
+ * folders and may still be writing to them when a run ends. GNU tar exits 1 on
+ * "file changed as we read it", which used to fail the whole restore. They are
+ * runtime state, not workspace output: sync-back never reads them from the
+ * remote and never clears, merges or deletes the local copies.
+ */
+export const SSH_SYNC_BACK_RUNTIME_ENTRIES: readonly string[] = [".claude", ".codex"];
+
+// `./name` anchors the tar exclude at the workspace root, so a nested folder
+// that happens to share the name (for example `docs/.claude`) still syncs.
+const SSH_SYNC_BACK_RUNTIME_TAR_EXCLUDES = SSH_SYNC_BACK_RUNTIME_ENTRIES.map((entry) => `./${entry}`);
+
 export async function syncDirectoryFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
@@ -1697,7 +1710,7 @@ export async function syncDirectoryFromSsh(input: {
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
+    `tar ${[...tarExcludeArgs([...SSH_SYNC_BACK_RUNTIME_TAR_EXCLUDES, ...(input.exclude ?? [])]).map(shellQuote), "-cf", "-", "."].join(" ")}`,
   ].join(" && ");
   const sshArgs = [
     ...auth.args,
@@ -1814,7 +1827,7 @@ export async function syncDirectoryFromSsh(input: {
     });
     await progress?.finish();
 
-    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
+    await clearLocalDirectory(input.localDir, [...SSH_SYNC_BACK_RUNTIME_ENTRIES, ...(input.preserveLocalEntries ?? [])]);
     await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
     await progress?.fail();
@@ -1948,7 +1961,23 @@ async function restoreWorkspaceRootFromSsh(input: {
 }): Promise<void> {
   const remoteDir = input.remoteDir;
   if (input.baselineSnapshot) {
-    const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+    // The remote tar never carries the runtime folders, so they must also leave
+    // the baseline: a baseline entry missing from the source reads as a remote
+    // deletion and would remove the local copy.
+    const missingRuntimeEntries = SSH_SYNC_BACK_RUNTIME_ENTRIES.filter(
+      (entry) => !input.baselineSnapshot!.exclude.includes(entry),
+    );
+    const baseline = missingRuntimeEntries.length > 0
+      ? await selectDirectorySnapshot(input.baselineSnapshot, {
+        omit: missingRuntimeEntries,
+        exclude: [...input.baselineSnapshot.exclude, ...missingRuntimeEntries],
+        ignoredPaths: input.baselineSnapshot.ignoredPaths,
+      })
+      : input.baselineSnapshot;
+    const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-")).catch(async (error: unknown) => {
+      if (baseline !== input.baselineSnapshot) await disposeDirectorySnapshot(baseline);
+      throw error;
+    });
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
       : null;
@@ -1967,12 +1996,14 @@ async function restoreWorkspaceRootFromSsh(input: {
         spec: input.spec,
         remoteDir,
         localDir: stagingDir,
+        // syncDirectoryFromSsh already leaves out the root runtime folders;
+        // a bare `.claude` here would make GNU tar drop nested ones too.
         exclude: input.baselineSnapshot.exclude,
         onProgress: input.onProgress,
         progressLabel: input.progressLabel,
       });
       await mergeDirectoryWithBaseline({
-        baseline: input.baselineSnapshot,
+        baseline,
         sourceDir: stagingDir,
         targetDir: input.localDir,
         // Git history advances via integrateImportedGitHead; the working tree
@@ -2001,6 +2032,7 @@ async function restoreWorkspaceRootFromSsh(input: {
         }).catch(() => undefined);
       }
       await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+      if (baseline !== input.baselineSnapshot) await disposeDirectorySnapshot(baseline);
     }
     return;
   }
