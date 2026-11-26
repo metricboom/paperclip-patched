@@ -55,6 +55,55 @@ describe("cleanupGeneratedCodexHomes", () => {
     expect(await exists(path.join(live, "sessions/f"))).toBe(true);
   });
 
+  it("keeps a shared home protected until every overlapping run has released its lease", async () => {
+    await makeHome("b".repeat(64), HOUR); // newer
+    const shared = await makeHome("c".repeat(64), 30 * DAY);
+    const releaseFirst = await acquireRunLease(shared, now);
+    const releaseSecond = await acquireRunLease(shared, now);
+    await releaseFirst();
+    await run();
+    expect(await exists(path.join(shared, "sessions/f"))).toBe(true);
+    await releaseSecond();
+    const idle = new Date(now - 30 * DAY);
+    // Taking and releasing leases touches the home; age it again to model a later pass.
+    await fs.utimes(path.join(shared, ".paperclip-run-leases"), idle, idle);
+    await fs.utimes(shared, idle, idle);
+    await run();
+    expect(await exists(shared)).toBe(false);
+  });
+
+  it("keeps a home whose lease is taken between the liveness check and the delete", async () => {
+    await makeHome("b".repeat(64), HOUR);
+    const racing = await makeHome("c".repeat(64), 30 * DAY);
+    let release: (() => Promise<void>) | null = null;
+    const result = await run({ hooks: { beforeClaim: async (target) => { if (target === racing) release = await acquireRunLease(racing, now); } } });
+    expect(release).not.toBeNull();
+    expect(result.removedHomes).toEqual([]);
+    expect(await exists(path.join(racing, "sessions/f"))).toBe(true);
+    expect(await exists(path.join(racing, "state.sqlite"))).toBe(true);
+  });
+
+  it("leaves a freshly recreated leased home alone when the lease lands after the claim", async () => {
+    await makeHome("b".repeat(64), HOUR);
+    const racing = await makeHome("c".repeat(64), 30 * DAY);
+    let release: (() => Promise<void>) | null = null;
+    await run({ hooks: { afterClaim: async (target) => { if (target === racing) release = await acquireRunLease(racing, now); } } });
+    expect(release).not.toBeNull();
+    // The old contents are gone (the adapter reseeds and starts a fresh session), but the leased home exists.
+    expect(await fs.readdir(path.join(racing, ".paperclip-run-leases"))).toHaveLength(1);
+    expect(await exists(path.join(racing, "sessions/f"))).toBe(false);
+    const leftovers = (await fs.readdir(agentDir)).filter((n) => n.startsWith(".removing-"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("does not remove a home that became active after the idle snapshot", async () => {
+    await makeHome("b".repeat(64), HOUR);
+    const racing = await makeHome("c".repeat(64), 30 * DAY);
+    const result = await run({ hooks: { beforeClaim: async (target) => { if (target === racing) { const t = new Date(now); await fs.utimes(path.join(racing, "state.sqlite"), t, t); } } } });
+    expect(result.removedHomes).toEqual([]);
+    expect(await exists(path.join(racing, "sessions/f"))).toBe(true);
+  });
+
   it("ignores a lease whose process is gone", async () => {
     await makeHome("b".repeat(64), HOUR);
     const dead = await makeHome("c".repeat(64), 30 * DAY);

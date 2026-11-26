@@ -734,6 +734,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void error;
     });
   }
+  // Generated per-run homes are pruned when runs end. Take this run's lease before the
+  // home is seeded, so a concurrent cleanup cannot remove it while it is being prepared.
+  // Each run has its own lease, so a same-digest run finishing first does not drop ours.
+  const generatedHome = runtimeSkillDigest && !useSshHostAuth && configuredHomeIsManaged ? configuredCodexHome : null;
+  const releaseHomeLease = generatedHome ? await acquireRunLease(generatedHome).catch(() => null) : null;
   if (!useSshHostAuth && configuredCodexHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
@@ -792,10 +797,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let sshHostHome: Awaited<ReturnType<typeof readCodexSshHostHome>> | null = null;
   let sshHostProfilePath: string | null = null;
   let sshSessionState: Awaited<ReturnType<typeof prepareCodexSshSessionState>> | null = null;
-  // Generated per-run homes are pruned when the run ends; the lease keeps this
-  // one from being pruned by a concurrent run of the same agent.
-  const generatedHome = runtimeSkillDigest && !useSshHostAuth && configuredHomeIsManaged ? configuredCodexHome : null;
-  const releaseHomeLease = generatedHome ? await acquireRunLease(generatedHome).catch(() => null) : null;
   let observabilityProfile: Awaited<ReturnType<typeof prepareCodexObservabilityProfile>> | null = null;
   let observabilityPreparationFailed = false;
   const runSshHostConfigurationCommand = async (command: string) => {
