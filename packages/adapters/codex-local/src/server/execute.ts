@@ -738,7 +738,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // home is seeded, so a concurrent cleanup cannot remove it while it is being prepared.
   // Each run has its own lease, so a same-digest run finishing first does not drop ours.
   const generatedHome = runtimeSkillDigest && !useSshHostAuth && configuredHomeIsManaged ? configuredCodexHome : null;
-  const releaseHomeLease = generatedHome ? await acquireRunLease(generatedHome).catch(() => null) : null;
+  // If the lease cannot be taken the run fails here, before any provider work. Continuing
+  // unprotected would let a concurrent cleanup remove the home mid-run.
+  const releaseHomeLease = generatedHome ? await acquireRunLease(generatedHome) : null;
+  // The `finally` that releases the lease starts further down. Anything that can throw before
+  // it must release the lease itself, or the home stays protected until this process exits.
+  const releasingLeaseOnError = <T,>(work: Promise<T>): Promise<T> =>
+    work.catch(async (error: unknown) => {
+      await releaseHomeLease?.();
+      throw error;
+    });
   if (!useSshHostAuth && configuredCodexHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
@@ -748,13 +757,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const seedEnv = runtimeSkillDigest ? {
       ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
     } : process.env;
-    await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
+    await releasingLeaseOnError(seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
-    });
+    }));
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
-  await fs.mkdir(effectiveCodexHome, { recursive: true });
+  await releasingLeaseOnError(fs.mkdir(effectiveCodexHome, { recursive: true }));
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
   // and with OPENAI_API_KEY="" the provider rejects every request with
@@ -766,7 +775,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // and sandbox targets are additionally allowed to supply their own login
   // (the pre-dispatch gate defers sandbox-destined runs here for exactly that
   // probe).
-  if (!useSshHostAuth) await assertCodexCredentialsLaunchable({
+  if (!useSshHostAuth) await releasingLeaseOnError(assertCodexCredentialsLaunchable({
     runId,
     companyId: agent.companyId,
     configuredCodexHome,
@@ -775,7 +784,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     target: executionTarget,
     cwd,
     onLog,
-  });
+  }));
   // Merge custom model providers (PAPERCLIP_CODEX_PROVIDERS) into the managed
   // CODEX_HOME's config.toml BEFORE the home is shipped to a remote execution
   // target, so both local and sandboxed Codex processes pick up the routing.
@@ -786,10 +795,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
+  const preparedRuntimeConfig = await releasingLeaseOnError(prepareCodexRuntimeConfig({
     env: envConfigStrings,
     codexHome: useSshHostAuth || (configuredCodexHome && !runtimeSkillDigest) ? null : effectiveCodexHome,
-  });
+  }));
   // Curated allowlist dir staged for the remote `home` asset (see below). Held
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.

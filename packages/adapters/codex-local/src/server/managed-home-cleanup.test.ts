@@ -72,34 +72,64 @@ describe("cleanupGeneratedCodexHomes", () => {
     expect(await exists(shared)).toBe(false);
   });
 
-  it("keeps a home whose lease is taken between the liveness check and the delete", async () => {
+  it("makes a run that leases while cleanup holds the claim wait, then never strands its home", async () => {
     await makeHome("b".repeat(64), HOUR);
     const racing = await makeHome("c".repeat(64), 30 * DAY);
-    let release: (() => Promise<void>) | null = null;
-    const result = await run({ hooks: { beforeClaim: async (target) => { if (target === racing) release = await acquireRunLease(racing, now); } } });
-    expect(release).not.toBeNull();
+    let pending: Promise<() => Promise<void>> | null = null;
+    let settledEarly = false;
+    const result = await run({ hooks: { afterClaim: async (home) => {
+      if (home !== racing) return;
+      pending = acquireRunLease(racing, now);
+      void pending.then(() => { settledEarly = true; }, () => {});
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(settledEarly).toBe(false); // the run is held back while the claim is held
+    } } });
+    const release = await pending!;
+    const leases = await fs.readdir(path.join(racing, ".paperclip-run-leases"));
+    expect(leases).toHaveLength(1); // the lease sits in the live home, not in a detached copy
+    expect(await fs.readdir(agentDir).then((names) => names.filter((n) => n.startsWith(".removing-")))).toEqual([]);
+    if (result.removedHomes.length === 0) expect(await exists(path.join(racing, "sessions/f"))).toBe(true); // cleanup backed off: data intact
+    await release();
+  });
+
+  it("backs off when a lease is already in place once the claim is held", async () => {
+    await makeHome("b".repeat(64), HOUR);
+    const racing = await makeHome("c".repeat(64), 30 * DAY);
+    const result = await run({ hooks: { afterClaim: async (home) => { if (home === racing) await fs.mkdir(path.join(home, ".paperclip-run-leases"), { recursive: true }).then(() => fs.writeFile(path.join(home, ".paperclip-run-leases", "x.json"), JSON.stringify({ pid: process.pid, startedAt: now }))); } } });
     expect(result.removedHomes).toEqual([]);
     expect(await exists(path.join(racing, "sessions/f"))).toBe(true);
     expect(await exists(path.join(racing, "state.sqlite"))).toBe(true);
   });
 
-  it("leaves a freshly recreated leased home alone when the lease lands after the claim", async () => {
+  it("skips a home another live cleaner has claimed, and steals a claim whose owner is dead", async () => {
     await makeHome("b".repeat(64), HOUR);
-    const racing = await makeHome("c".repeat(64), 30 * DAY);
-    let release: (() => Promise<void>) | null = null;
-    await run({ hooks: { afterClaim: async (target) => { if (target === racing) release = await acquireRunLease(racing, now); } } });
-    expect(release).not.toBeNull();
-    // The old contents are gone (the adapter reseeds and starts a fresh session), but the leased home exists.
-    expect(await fs.readdir(path.join(racing, ".paperclip-run-leases"))).toHaveLength(1);
-    expect(await exists(path.join(racing, "sessions/f"))).toBe(false);
-    const leftovers = (await fs.readdir(agentDir)).filter((n) => n.startsWith(".removing-"));
-    expect(leftovers).toEqual([]);
+    const target = await makeHome("c".repeat(64), 30 * DAY);
+    const claimPath = path.join(agentDir, `.claim-${path.basename(target)}`);
+    await fs.writeFile(claimPath, JSON.stringify({ pid: process.pid, startedAt: now }));
+    expect((await run()).removedHomes).toEqual([]);
+    expect(await exists(target)).toBe(true);
+    await fs.writeFile(claimPath, JSON.stringify({ pid: 2 ** 22 + 54321, startedAt: now }));
+    expect((await run()).removedHomes).toEqual([target]);
+    expect(await exists(claimPath)).toBe(false);
+  });
+
+  it("only sweeps detached leftovers, never a live home, even a leased or recently active one", async () => {
+    await makeHome("b".repeat(64), HOUR);
+    const leased = await makeHome("c".repeat(64), 30 * DAY);
+    await acquireRunLease(leased, now);
+    const stale = path.join(agentDir, ".removing-old");
+    await fs.mkdir(stale, { recursive: true });
+    const old = new Date(now - 2 * HOUR);
+    await fs.utimes(stale, old, old);
+    await run();
+    expect(await exists(stale)).toBe(false);
+    expect(await exists(path.join(leased, "sessions/f"))).toBe(true);
   });
 
   it("does not remove a home that became active after the idle snapshot", async () => {
     await makeHome("b".repeat(64), HOUR);
     const racing = await makeHome("c".repeat(64), 30 * DAY);
-    const result = await run({ hooks: { beforeClaim: async (target) => { if (target === racing) { const t = new Date(now); await fs.utimes(path.join(racing, "state.sqlite"), t, t); } } } });
+    const result = await run({ hooks: { afterClaim: async (home) => { if (home === racing) { const t = new Date(now); await fs.utimes(path.join(racing, "state.sqlite"), t, t); } } } });
     expect(result.removedHomes).toEqual([]);
     expect(await exists(path.join(racing, "sessions/f"))).toBe(true);
   });
