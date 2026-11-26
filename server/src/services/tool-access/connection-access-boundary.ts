@@ -13,6 +13,12 @@ type ReadDb = Pick<Db, "select">;
 export type ConnectionAccessBoundary = {
   installedForAgent: boolean;
   hasAnyInstalls: boolean;
+  /**
+   * The connection has no company install and is installed only on other
+   * agents. Such a connection belongs to those agents: no grant, policy or
+   * trust rule may offer or allow it to this agent.
+   */
+  installedOnlyForOtherAgents: boolean;
   agentAccessConfigured: boolean;
   hasManagedProfile: boolean;
   hasUnboundManagedProfile: boolean;
@@ -163,6 +169,10 @@ export async function readConnectionAccessBoundaries(
         || (install.targetType === "agent" && install.targetId === input.agentId),
       ),
     );
+    const installedOnlyForOtherAgents = Boolean(input.agentId)
+      && !installedForAgent
+      && installs.some((install) => install.targetType === "agent")
+      && !installs.some((install) => install.targetType === "company");
     const agentAccessConfigured = Boolean(meta?.agentAccessConfigured);
     const managed = managedByConnectionId.get(connectionId) ?? [];
     const hasManagedProfile = managed.length > 0;
@@ -176,6 +186,7 @@ export async function readConnectionAccessBoundaries(
     result.set(connectionId, {
       installedForAgent,
       hasAnyInstalls,
+      installedOnlyForOtherAgents,
       agentAccessConfigured,
       hasManagedProfile,
       hasUnboundManagedProfile,

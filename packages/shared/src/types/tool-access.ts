@@ -83,7 +83,7 @@ export type ConnectionGrantStatus =
   "active" | "revoked" | "expired" | "needs_reauthorization";
 export type ToolConnectionCredentialPolicy =
   "shared" | "per_user" | "per_user_with_fallback" | "per_agent";
-export type ConnectionGrantMemberSubjectType = "user";
+export type ConnectionGrantMemberSubjectType = "user" | "agent";
 export type ToolCredentialPlacement = "header" | "env" | "url";
 
 export interface McpConnectionCredentialRef {
@@ -1587,6 +1587,7 @@ export type ToolAccessReasonCode =
   | "deny_company_boundary"
   | "deny_disabled_connection"
   | "deny_connection_not_installed"
+  | "deny_connection_not_installed_for_agent"
   | "deny_disabled_application"
   | "deny_archived_application"
   | "deny_missing_tool"

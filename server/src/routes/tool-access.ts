@@ -2069,11 +2069,13 @@ function connectorEnrollmentPrincipal(req: Request): string {
       const isGrantCreator = Boolean(connectionRequestUserId(req) && target.createdByUserId === connectionRequestUserId(req));
       if (!isGrantCreator) await assertToolConnectionConfigureAccess(req, connection);
       const memberUserIds = req.body.memberUserIds as string[];
+      const memberAgentIds = req.body.memberAgentIds as string[] | undefined;
       const grant = await svc.replaceConnectionGrantMembers(
         connection.id,
         target.id,
         memberUserIds,
         connectionRequestActor(req),
+        memberAgentIds,
       );
       await logActivity(db, {
         companyId: connection.companyId,
@@ -2081,7 +2083,11 @@ function connectorEnrollmentPrincipal(req: Request): string {
         action: "tool_connection.grant_audience_replaced",
         entityType: "connection_grant",
         entityId: grant.id,
-        details: { connectionId: connection.id, memberCount: memberUserIds.length },
+        details: {
+          connectionId: connection.id,
+          memberCount: memberUserIds.length,
+          ...(memberAgentIds === undefined ? {} : { agentMemberCount: memberAgentIds.length }),
+        },
       });
       res.json(grant);
     },

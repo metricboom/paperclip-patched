@@ -21,6 +21,8 @@ import type { createConnectionCredentialValidation } from "./credential-validati
 import { releaseProviderLimitWaits } from "../../heartbeat/provider-limit-wait.js";
 import { publishActivity } from "../../activity-log.js";
 import type { ActivityPublication } from "../../../types/activity-publication.js";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 type GrantDependencies = {
   getConnectionRow(idOrUid: string, companyId?: string): Promise<typeof toolConnections.$inferSelect>;
   assertSecretRefs: ReturnType<typeof createConnectionCredentialValidation>;
@@ -132,12 +134,19 @@ listConnectionAudienceMembers: async (companyId: string) => {
      * that fail-closed marker after cleanup wins. Once cleanup has retained that
      * marker, callers must restore the member or replace it with an active named
      * audience before widening access to the whole company.
+     *
+     * `memberAgentIds` names agents whose runs without an acting user may use
+     * the grant. `undefined` keeps the current agent members, so existing
+     * user-only callers never drop them; an array replaces them. Every agent
+     * must be a current (not pending or terminated) agent of the connection's
+     * company. The audience means "every member" only when both lists are empty.
      */
 replaceConnectionGrantMembers: async (
       idOrUid: string,
       grantId: string,
       memberUserIds: string[],
       actor?: ActorInfo,
+      memberAgentIds?: string[],
     ) => {
       await actor?.managementContext?.reauthorize();
       const connection = await getConnectionRow(idOrUid);
@@ -161,25 +170,63 @@ replaceConnectionGrantMembers: async (
       const requested = [
         ...new Set(memberUserIds.map((id) => id.trim()).filter(Boolean)),
       ];
+      const requestedAgentIds = memberAgentIds === undefined
+        ? undefined
+        : [...new Set(memberAgentIds.map((id) => id.trim()).filter(Boolean))];
       const binding = actorBinding(actor);
       const members = await db.transaction(async (tx) => {
         // Serialize replacements before taking the current audience snapshot.
         // Otherwise a second replacement could read the old rows, wait behind
         // an in-flight replacement, and then miss locking a newly-added member.
         await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"paperclip.connection_grant_audience:" + grant.id}, 0))`);
-        const existingAudience = await tx
+        const existingRows = await tx
           .select()
           .from(connectionGrantMembers)
           .where(
             and(
               eq(connectionGrantMembers.companyId, connection.companyId),
               eq(connectionGrantMembers.grantId, grant.id),
-              eq(connectionGrantMembers.subjectType, "user"),
             ),
           );
+        const existingAudience = existingRows.filter((row) => row.subjectType === "user");
+        const existingAgentRows = existingRows.filter((row) => row.subjectType === "agent");
         const existingUserIds = [
           ...new Set(existingAudience.map((row) => row.subjectId)),
         ];
+        const existingAgentIds = [
+          ...new Set(existingAgentRows.map((row) => row.subjectId)),
+        ];
+        const nextAgentIds = requestedAgentIds ?? existingAgentIds;
+        if (requestedAgentIds && requestedAgentIds.length > 0) {
+          // Agent ids are uuids; anything else cannot name an agent and must
+          // not reach the uuid column comparison.
+          const wellFormed = requestedAgentIds.filter((id) => UUID_PATTERN.test(id));
+          const eligible = wellFormed.length === 0
+            ? []
+            : await tx
+                .select({ id: agents.id })
+                .from(agents)
+                .where(
+                  and(
+                    eq(agents.companyId, connection.companyId),
+                    inArray(agents.id, wellFormed),
+                    notInArray(agents.status, ["pending_approval", "terminated"]),
+                  ),
+                )
+                .orderBy(asc(agents.id))
+                .for("no key update");
+          const eligibleIds = new Set(eligible.map((row) => row.id));
+          const unknownAgentIds = requestedAgentIds.filter((id) => !eligibleIds.has(id));
+          if (unknownAgentIds.length > 0) {
+            throw unprocessable(
+              "Every audience agent must be an active agent of this company",
+              {
+                code: "audience_member_not_in_company",
+                unknownAgentIds,
+              },
+            );
+          }
+        }
         const membershipUserIds = [
           ...new Set([...existingUserIds, ...requested]),
         ];
@@ -221,7 +268,7 @@ replaceConnectionGrantMembers: async (
           const inactiveExisting = existingUserIds.filter(
             (id) => !active.has(id),
           );
-          if (requested.length === 0 && inactiveExisting.length > 0) {
+          if (requested.length === 0 && nextAgentIds.length === 0 && inactiveExisting.length > 0) {
             throw conflict(
               "Replace inactive audience members before widening access to the whole company",
               {
@@ -243,7 +290,11 @@ replaceConnectionGrantMembers: async (
           )
           .for("update");
         const existingUserSet = new Set(existingUserIds);
-        if (requested.length === existingUserSet.size && requested.every(id => existingUserSet.has(id))) return existingAudience;
+        const existingAgentSet = new Set(existingAgentIds);
+        if (
+          requested.length === existingUserSet.size && requested.every(id => existingUserSet.has(id))
+          && nextAgentIds.length === existingAgentSet.size && nextAgentIds.every(id => existingAgentSet.has(id))
+        ) return existingRows;
         await tx
           .delete(connectionGrantMembers)
           .where(
@@ -252,17 +303,20 @@ replaceConnectionGrantMembers: async (
               eq(connectionGrantMembers.grantId, grant.id),
             ),
           );
+        const nextRows = [
+          ...requested.map((subjectId) => ({ subjectType: "user" as const, subjectId })),
+          ...nextAgentIds.map((subjectId) => ({ subjectType: "agent" as const, subjectId })),
+        ];
         const inserted =
-          requested.length === 0
+          nextRows.length === 0
             ? []
             : await tx
                 .insert(connectionGrantMembers)
                 .values(
-                  requested.map((subjectId) => ({
+                  nextRows.map((row) => ({
                     companyId: connection.companyId,
                     grantId: grant.id,
-                    subjectType: "user" as const,
-                    subjectId,
+                    ...row,
                   })),
                 )
                 .returning();
@@ -284,6 +338,9 @@ replaceConnectionGrantMembers: async (
           grantId: grant.id,
           memberCount: members.length,
           memberUserIds: requested,
+          memberAgentIds: members
+            .filter((member) => member.subjectType === "agent")
+            .map((member) => member.subjectId),
         },
       });
       return { ...toConnectionGrant(grant), members };

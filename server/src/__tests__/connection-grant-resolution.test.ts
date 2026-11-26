@@ -23,4 +23,21 @@ describe("connection grant resolution", () => {
     expect(isConnectionGrantAudienceAllowed([], "alice", false)).toBe(false);
     expect(isConnectionGrantAudienceAllowed(["alice"], "alice", false)).toBe(false);
   });
+
+  it("admits a run with no acting user only when its agent is an agent member", () => {
+    const agents = { memberAgentIds: ["agent-x"] };
+    expect(isConnectionGrantAudienceAllowed(["jamie"], null, false, { ...agents, actingAgentId: "agent-x" })).toBe(true);
+    expect(isConnectionGrantAudienceAllowed(["jamie"], null, false, { ...agents, actingAgentId: "agent-y" })).toBe(false);
+    expect(isConnectionGrantAudienceAllowed(["jamie"], null, false, { ...agents, actingAgentId: null })).toBe(false);
+    expect(isConnectionGrantAudienceAllowed([], null, false, { ...agents, actingAgentId: "agent-x" })).toBe(true);
+    expect(isConnectionGrantAudienceAllowed([], null, false, { ...agents, actingAgentId: "agent-y" })).toBe(false);
+    // An audience of agents only is not "all members".
+    expect(isConnectionGrantAudienceAllowed([], "jamie", true, agents)).toBe(false);
+    // A run with an acting user keeps the user check, agent membership aside.
+    expect(isConnectionGrantAudienceAllowed(["jamie"], "jamie", true, { ...agents, actingAgentId: "agent-y" })).toBe(true);
+    expect(isConnectionGrantAudienceAllowed(["jamie"], "carol", true, { ...agents, actingAgentId: "agent-x" })).toBe(false);
+    expect(isConnectionGrantAudienceAllowed(["jamie"], "jamie", false, { ...agents, actingAgentId: "agent-x" })).toBe(false);
+    // Both lists empty is everyone.
+    expect(isConnectionGrantAudienceAllowed([], null, false, { memberAgentIds: [], actingAgentId: "agent-y" })).toBe(true);
+  });
 });

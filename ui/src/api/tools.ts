@@ -417,12 +417,14 @@ export const toolsApi = {
   ),
   revokeConnectionGrant: (connectionId: string, grantId: string) =>
     api.delete<ConnectionGrantRevocationResult>(`/tool-connections/${connectionId}/grants/${grantId}`),
-  // An empty `memberUserIds` is the canonical "all organization members".
-  // Replacement is atomic server-side, so this never partially widens access.
-  replaceConnectionGrantMembers: (connectionId: string, grantId: string, memberUserIds: string[]) =>
+  // An empty `memberUserIds` is the canonical "all organization members" when
+  // the grant has no agent members. Omitting `memberAgentIds` keeps the grant's
+  // agent members. Replacement is atomic server-side, so this never partially
+  // widens access.
+  replaceConnectionGrantMembers: (connectionId: string, grantId: string, memberUserIds: string[], memberAgentIds?: string[]) =>
     api.put<ConnectionGrant>(
       `/tool-connections/${connectionId}/grants/${grantId}/members`,
-      { memberUserIds },
+      memberAgentIds === undefined ? { memberUserIds } : { memberUserIds, memberAgentIds },
     ),
   /**
    * Start the signed-in user's own personal authorization. `subjectUserId` must

@@ -2049,6 +2049,96 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("stores agent members in an organization grant audience and reads them back with their subject type", async () => {
+    const company = await createCompany(db);
+    const otherCompany = await createCompany(db);
+    const agentX = await createAgent(db, company.id);
+    const terminatedAgent = await createAgent(db, company.id, "terminated");
+    const outsiderAgent = await createAgent(db, otherCompany.id);
+    const { connection } = await createBrokerConnection(db, company.id);
+    const [grant] = await db
+      .insert(connectionGrants)
+      .values({
+        companyId: company.id,
+        connectionId: connection.id,
+        kind: "organization",
+        credentialSecretRefs: connection.credentialSecretRefs,
+        status: "active",
+        isDefault: true,
+      })
+      .returning();
+    const app = createRouteApp(db, boardSessionActor(company.id, "owner", "jamie"));
+    const membersPath = `/api/tool-connections/${connection.id}/grants/${grant!.id}/members`;
+    const storedMembers = async () =>
+      (await db.select().from(connectionGrantMembers).where(eq(connectionGrantMembers.grantId, grant!.id)))
+        .map((row) => `${row.subjectType}:${row.subjectId}`)
+        .sort();
+
+    const both = await request(app).put(membersPath).send({ memberUserIds: ["jamie"], memberAgentIds: [agentX.id] });
+    expect(both.status).toBe(200);
+    expect(both.body.members).toEqual(expect.arrayContaining([
+      expect.objectContaining({ subjectType: "user", subjectId: "jamie" }),
+      expect.objectContaining({ subjectType: "agent", subjectId: agentX.id }),
+    ]));
+    expect(await storedMembers()).toEqual([`agent:${agentX.id}`, "user:jamie"].sort());
+
+    const listed = await request(app).get(`/api/tool-connections/${connection.id}/grants`);
+    expect(listed.status).toBe(200);
+    const listedGrant = (listed.body.grants as Array<{ id: string; members: Array<{ subjectType: string; subjectId: string }> }>)
+      .find((item) => item.id === grant!.id)!;
+    expect(listedGrant.members.map((member) => `${member.subjectType}:${member.subjectId}`).sort())
+      .toEqual([`agent:${agentX.id}`, "user:jamie"].sort());
+
+    // An unknown, other-company, terminated or malformed agent id is refused
+    // with 422 and leaves the audience untouched.
+    for (const badAgentId of [randomUUID(), outsiderAgent.id, terminatedAgent.id, "not-a-uuid"]) {
+      const refused = await request(app).put(membersPath).send({ memberUserIds: ["jamie"], memberAgentIds: [badAgentId] });
+      expect(refused.status).toBe(422);
+      expect(refused.body).toMatchObject({
+        code: "audience_member_not_in_company",
+        details: { unknownAgentIds: [badAgentId] },
+      });
+      expect(await storedMembers()).toEqual([`agent:${agentX.id}`, "user:jamie"].sort());
+    }
+
+    // A user-only body keeps working as before and does not drop agent members.
+    const userOnly = await request(app).put(membersPath).send({ memberUserIds: [] });
+    expect(userOnly.status).toBe(200);
+    expect(await storedMembers()).toEqual([`agent:${agentX.id}`]);
+
+    // Both lists empty is the canonical "all organization members".
+    const cleared = await request(app).put(membersPath).send({ memberUserIds: [], memberAgentIds: [] });
+    expect(cleared.status).toBe(200);
+    expect(await storedMembers()).toEqual([]);
+  });
+
+  it("keeps a user-only audience replacement unchanged for grants without agent members", async () => {
+    const company = await createCompany(db);
+    await grantBoardUser(db, company.id, "jamie", [], "member");
+    await grantBoardUser(db, company.id, "sales-user", [], "member");
+    const { connection } = await createBrokerConnection(db, company.id);
+    const [grant] = await db
+      .insert(connectionGrants)
+      .values({
+        companyId: company.id,
+        connectionId: connection.id,
+        kind: "organization",
+        credentialSecretRefs: connection.credentialSecretRefs,
+        status: "active",
+        isDefault: true,
+      })
+      .returning();
+    const service = createTestToolAccessService(db);
+    const replaced = await service.replaceConnectionGrantMembers(connection.id, grant!.id, ["jamie", "sales-user"]);
+    expect(replaced.members.map((member) => `${member.subjectType}:${member.subjectId}`).sort())
+      .toEqual(["user:jamie", "user:sales-user"]);
+    await expect(service.replaceConnectionGrantMembers(connection.id, grant!.id, ["outsider"]))
+      .rejects.toMatchObject({ status: 422, details: { code: "audience_member_not_in_company", unknownUserIds: ["outsider"] } });
+    const cleared = await service.replaceConnectionGrantMembers(connection.id, grant!.id, []);
+    expect(cleared.members).toEqual([]);
+    expect(await db.select().from(connectionGrantMembers).where(eq(connectionGrantMembers.grantId, grant!.id))).toEqual([]);
+  });
+
   it.each(["suspend", "archive", "remove"] as const)(
     "keeps an organization audience fail-closed when empty replacement races with member %s",
     async (cleanupKind) => {

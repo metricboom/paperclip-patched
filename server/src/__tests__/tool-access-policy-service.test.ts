@@ -1978,7 +1978,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(await decideFor(agentB.id)).toMatchObject({
       allowed: false,
       decision: "deny",
-      reasonCode: "deny_connection_not_installed",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
     // An agent created after the connection was installed for Agent A must also be denied.
@@ -1987,7 +1987,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(await decideFor(agentC.id)).toMatchObject({
       allowed: false,
       decision: "deny",
-      reasonCode: "deny_connection_not_installed",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
     // Simulate a pre-marker connection whose wizard-authored app_gallery_finish
@@ -2184,9 +2184,9 @@ describeEmbeddedPostgres("tool access policy service", () => {
     const testA = await policyTest(agentA.id).expect(200);
     expect(testA.body.decision).toMatchObject({ allowed: true, decision: "allow", reasonCode: "allow_profile" });
     const testB = await policyTest(agentB.id).expect(200);
-    expect(testB.body.decision).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_connection_not_installed" });
+    expect(testB.body.decision).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_connection_not_installed_for_agent" });
     const testC = await policyTest(agentC.id).expect(200);
-    expect(testC.body.decision).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_connection_not_installed" });
+    expect(testC.body.decision).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_connection_not_installed_for_agent" });
 
     // 2. Effective Access view agrees with policy/test for all three agents
     const effA = await effectiveAccess(agentA.id).expect(200);
@@ -2215,9 +2215,9 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(remoteCalls).toEqual(["list_messages"]);
 
     await expect(gateway.executeTool({ sessionToken: sessionB.token, tool: toolA!.name, parameters: {} }))
-      .rejects.toMatchObject({ reasonCode: "deny_connection_not_installed" });
+      .rejects.toMatchObject({ reasonCode: "deny_connection_not_installed_for_agent" });
     await expect(gateway.executeTool({ sessionToken: sessionC.token, tool: toolA!.name, parameters: {} }))
-      .rejects.toMatchObject({ reasonCode: "deny_connection_not_installed" });
+      .rejects.toMatchObject({ reasonCode: "deny_connection_not_installed_for_agent" });
     expect(remoteCalls).toEqual(["list_messages"]);
   });
 
@@ -2308,10 +2308,10 @@ describeEmbeddedPostgres("tool access policy service", () => {
       companyId: company.id,
       actor: { actorType: "agent", actorId: agentB.id, agentId: agentB.id },
       request: { connectionId: connection!.id, catalogEntryId: catalogEntry!.id, toolName: "read_record" },
-    })).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_connection_not_installed" });
+    })).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_connection_not_installed_for_agent" });
   });
 
-  it("denies generic require_approval for uninstalled or removed agents while preserving explicit allow policies and tool-targeted grants", async () => {
+  it("denies generic require_approval for uninstalled or removed agents, and keeps an agent-only install closed to allow policies and tool-targeted grants", async () => {
     const company = await createCompany(db);
     const agentA = await createAgent(db, company.id);
     const agentB = await createAgent(db, company.id);
@@ -2381,7 +2381,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(await decideFor(agentB.id)).toMatchObject({
       allowed: false,
       decision: "deny",
-      reasonCode: "deny_connection_not_installed",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
     // Removing Agent A's final install immediately denies instead of returning
@@ -2408,16 +2408,17 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(await decideFor(agentB.id)).toMatchObject({
       allowed: false,
       decision: "deny",
-      reasonCode: "deny_connection_not_installed",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
-    // Without the higher-priority require_approval policy, an explicit operator
-    // allow policy or tool-targeted tools:use grant authorizes Agent B.
+    // A connection installed only on Agent A belongs to Agent A: even without
+    // the require_approval policy, an explicit allow policy or a tool-targeted
+    // tools:use grant does not open it to Agent B.
     await db.delete(toolPolicies).where(eq(toolPolicies.id, approvalPolicy!.id));
     expect(await decideFor(agentB.id)).toMatchObject({
-      allowed: true,
-      decision: "allow",
-      reasonCode: "allow_policy",
+      allowed: false,
+      decision: "deny",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
     await db.delete(toolPolicies).where(eq(toolPolicies.id, allowPolicy!.id));
@@ -2430,9 +2431,9 @@ describeEmbeddedPostgres("tool access policy service", () => {
         eq(principalPermissionGrants.permissionKey, "tools:use"),
       ));
     expect(await decideFor(agentB.id)).toMatchObject({
-      allowed: true,
-      decision: "allow",
-      reasonCode: "allow_explicit_grant",
+      allowed: false,
+      decision: "deny",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
     await db
@@ -2444,12 +2445,12 @@ describeEmbeddedPostgres("tool access policy service", () => {
         eq(principalPermissionGrants.permissionKey, "tools:use"),
       ));
     expect(await decideFor(agentB.id)).toMatchObject({
-      allowed: true,
-      decision: "allow",
-      reasonCode: "allow_explicit_grant",
+      allowed: false,
+      decision: "deny",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
 
-    // Reverting Agent B to default unscoped tools:use restores denial.
+    // Reverting Agent B to default unscoped tools:use is denied the same way.
     await db
       .update(principalPermissionGrants)
       .set({ scope: null })
@@ -2461,7 +2462,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(await decideFor(agentB.id)).toMatchObject({
       allowed: false,
       decision: "deny",
-      reasonCode: "deny_connection_not_installed",
+      reasonCode: "deny_connection_not_installed_for_agent",
     });
   });
 });

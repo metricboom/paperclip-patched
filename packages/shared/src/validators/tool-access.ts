@@ -294,9 +294,15 @@ export type PutToolConnectionInstalls = z.infer<typeof putToolConnectionInstalls
  * the canonical encoding of "all organization members" — the UI never exposes
  * "empty list" as the mental model, so the wire format carries the emptiness and
  * the copy layer translates it.
+ *
+ * `memberAgentIds` optionally names agents whose runs (with no acting user) may
+ * use the grant. Omitting it keeps the grant's current agent members; an array
+ * replaces them. The audience means "all organization members" only when both
+ * the user and the agent members end up empty.
  */
 export const replaceConnectionGrantMembersSchema = z.object({
   memberUserIds: z.array(z.string().trim().min(1).max(500)).max(1000),
+  memberAgentIds: z.array(z.string().trim().min(1).max(500)).max(1000).optional(),
 }).strict();
 
 export type ReplaceConnectionGrantMembersInput = z.infer<typeof replaceConnectionGrantMembersSchema>;

@@ -1643,6 +1643,13 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       return decision("deny", "deny_connection_not_installed",
         "This connection is not installed for this agent.", [], [], { redactionPlan: redaction.redactionPlan });
     }
+    // A connection installed only on specific agents (no company install)
+    // belongs to those agents. Deny every other agent before grants, allow
+    // policies or trust rules are consulted, so none of them can offer it.
+    if (ctx.actorType === "agent" && ctx.connectionId && connectionBoundary?.installedOnlyForOtherAgents) {
+      return decision("deny", "deny_connection_not_installed_for_agent",
+        "This connection is installed only for other agents.", [], [], { redactionPlan: redaction.redactionPlan });
+    }
     const blockedByConnectionInstall = Boolean(
       connectionBoundary && connectionBoundary.requiresInstall && !connectionBoundary.installedForAgent,
     );

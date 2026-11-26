@@ -1,4 +1,5 @@
 import { nativeProviderCatalogFor } from "../../native-provider-catalogs.js";
+import { isConnectionGrantAudienceAllowed, splitConnectionGrantAudience } from "../grant-audience.js";
 import { restConnectorFor } from "../../connectors/rest-registry.js";
 import { isBrowserUseConnection } from "../../browser-use-client.js";
 import { and, eq, sql } from "drizzle-orm";
@@ -404,25 +405,28 @@ export function createConnectionTokenBroker(db: Db, { now, secrets, policySvc, a
               .limit(1)
               .then((rows) => rows[0] ?? null)
           : null;
-        const audience = await db
-          .select({ subjectId: connectionGrantMembers.subjectId })
+        const audience = splitConnectionGrantAudience(await db
+          .select({ subjectType: connectionGrantMembers.subjectType, subjectId: connectionGrantMembers.subjectId })
           .from(connectionGrantMembers)
           .where(
             and(
               eq(connectionGrantMembers.companyId, connection.companyId),
               eq(connectionGrantMembers.grantId, grant.id),
-              eq(connectionGrantMembers.subjectType, "user"),
             ),
-          );
+          ));
         if (
-          (actingUserId !== null && !activeAudienceMember) ||
-          (audience.length > 0 &&
-            (!actingUserId ||
-              !audience.some((member) => member.subjectId === actingUserId)))
+          !isConnectionGrantAudienceAllowed(
+            audience.memberUserIds,
+            actingUserId,
+            Boolean(activeAudienceMember),
+            { memberAgentIds: audience.memberAgentIds, actingAgentId: input.agentId },
+          )
         ) {
           await fail(
             403,
-            "The acting user is not in this grant's audience",
+            actingUserId
+              ? "The acting user is not in this grant's audience"
+              : "This agent is not in this grant's audience",
             "denied",
             "grant_audience_denied",
             {
