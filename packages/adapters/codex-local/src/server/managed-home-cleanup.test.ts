@@ -1,0 +1,131 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { digestCodexConfigForHomeIdentity, resolveManagedCodexHomeDir } from "./codex-home.js";
+import { acquireRunLease, cleanupGeneratedCodexHomes } from "./managed-home-cleanup.js";
+
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+const COMPANY = "company-1";
+const AGENT = "agent-1";
+const digest = (n: number) => String(n).repeat(64).slice(0, 64).replace(/[^a-f0-9]/g, "a");
+
+describe("cleanupGeneratedCodexHomes", () => {
+  let root: string;
+  let env: NodeJS.ProcessEnv;
+  let agentDir: string;
+  const now = Date.now();
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-cleanup-"));
+    env = { PAPERCLIP_HOME: root, PAPERCLIP_INSTANCE_ID: "test" };
+    agentDir = path.join(resolveManagedCodexHomeDir(env, COMPANY), "skill-runtimes", AGENT);
+  });
+  afterEach(async () => { await fs.rm(root, { recursive: true, force: true }); });
+
+  async function makeHome(name: string, ageMs: number, parent = agentDir) {
+    const home = path.join(parent, name);
+    for (const dir of ["plugins/cache", "cache", "sessions"]) {
+      await fs.mkdir(path.join(home, dir), { recursive: true });
+      await fs.writeFile(path.join(home, dir, "f"), "x");
+    }
+    await fs.writeFile(path.join(home, "state.sqlite"), "db");
+    const when = new Date(now - ageMs);
+    for (const entry of [home, ...(await fs.readdir(home)).map((e) => path.join(home, e))]) await fs.utimes(entry, when, when);
+    return home;
+  }
+  const exists = (p: string) => fs.access(p).then(() => true, () => false);
+  const run = (extra: Partial<Parameters<typeof cleanupGeneratedCodexHomes>[0]> = {}) =>
+    cleanupGeneratedCodexHomes({ env, companyId: COMPANY, agentId: AGENT, now, ...extra });
+
+  it("keeps the newest home untouched even when idle", async () => {
+    const newest = await makeHome("a".repeat(64), 30 * DAY);
+    const result = await run();
+    expect(result.removedHomes).toEqual([]);
+    expect(await exists(path.join(newest, "plugins"))).toBe(true);
+  });
+
+  it("keeps a home with a live lease", async () => {
+    await makeHome("b".repeat(64), HOUR); // newer
+    const live = await makeHome("c".repeat(64), 30 * DAY);
+    await acquireRunLease(live, now);
+    await run();
+    expect(await exists(path.join(live, "plugins"))).toBe(true);
+    expect(await exists(path.join(live, "sessions/f"))).toBe(true);
+  });
+
+  it("ignores a lease whose process is gone", async () => {
+    await makeHome("b".repeat(64), HOUR);
+    const dead = await makeHome("c".repeat(64), 30 * DAY);
+    await fs.writeFile(path.join(dead, ".paperclip-run-lease"), JSON.stringify({ pid: 2 ** 22 + 12345, startedAt: now }));
+    await run();
+    expect(await exists(dead)).toBe(false);
+  });
+
+  it("prunes only rebuildable dirs of a moderately idle home", async () => {
+    await makeHome("b".repeat(64), 0);
+    const stale = await makeHome("c".repeat(64), 4 * HOUR);
+    await run();
+    expect(await exists(path.join(stale, "plugins"))).toBe(false);
+    expect(await exists(path.join(stale, "cache"))).toBe(false);
+    expect(await exists(path.join(stale, "sessions/f"))).toBe(true);
+    expect(await exists(path.join(stale, "state.sqlite"))).toBe(true);
+  });
+
+  it("leaves recently used homes alone", async () => {
+    await makeHome("b".repeat(64), 0);
+    const recent = await makeHome("c".repeat(64), HOUR);
+    const result = await run();
+    expect(result.prunedRuntime).toEqual([]);
+    expect(await exists(path.join(recent, "plugins"))).toBe(true);
+  });
+
+  it("removes a long-idle home entirely, but not the current one", async () => {
+    await makeHome("b".repeat(64), 0);
+    const old = await makeHome("c".repeat(64), 10 * DAY);
+    const current = await makeHome("d".repeat(64), 10 * DAY);
+    const result = await run({ currentHome: current });
+    expect(await exists(old)).toBe(false);
+    expect(await exists(current)).toBe(true);
+    expect(result.removedHomes).toEqual([old]);
+    expect(result.bytesFreedEstimate).toBeGreaterThan(0);
+  });
+
+  it("never touches paths outside the managed tree", async () => {
+    await makeHome("b".repeat(64), 0);
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "codex-outside-"));
+    try {
+      const external = await makeHome("e".repeat(64), 30 * DAY, outside);
+      // non-digest sibling, symlink to the outside home, and a traversal agent id
+      await makeHome("not-a-digest", 30 * DAY);
+      await fs.symlink(external, path.join(agentDir, "f".repeat(64)));
+      await run();
+      await cleanupGeneratedCodexHomes({ env, companyId: COMPANY, agentId: "../../..", now });
+      expect(await exists(path.join(external, "plugins"))).toBe(true);
+      expect(await exists(path.join(external, "sessions/f"))).toBe(true);
+      expect(await exists(path.join(agentDir, "not-a-digest/plugins"))).toBe(true);
+      expect((await fs.lstat(path.join(agentDir, "f".repeat(64)))).isSymbolicLink()).toBe(true);
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("does not touch another agent's homes", async () => {
+    await makeHome("b".repeat(64), 0);
+    const other = await makeHome("c".repeat(64), 30 * DAY, path.join(path.dirname(agentDir), "agent-2"));
+    await run();
+    expect(await exists(path.join(other, "plugins"))).toBe(true);
+  });
+});
+
+describe("digestCodexConfigForHomeIdentity", () => {
+  const base = 'model = "gpt-5"\n\n[mcp_servers.x]\nurl = "https://x"\n';
+  it("ignores Codex project trust entries and the managed MCP block", () => {
+    const noisy = `${base}\n[projects."/tmp/run-1"]\ntrust_level = "trusted"\n\n# BEGIN PAPERCLIP MANAGED MCP\n[mcp_servers.pc]\nhttp_headers = { Authorization = "Bearer t1" }\n# END PAPERCLIP MANAGED MCP\n`;
+    expect(digestCodexConfigForHomeIdentity(noisy)).toBe(digestCodexConfigForHomeIdentity(base));
+  });
+  it("still changes when an operator edits the config", () => {
+    expect(digestCodexConfigForHomeIdentity(base.replace("gpt-5", "gpt-6"))).not.toBe(digestCodexConfigForHomeIdentity(base));
+  });
+});

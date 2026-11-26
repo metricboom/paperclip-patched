@@ -94,6 +94,8 @@ import {
   writeManagedCodexMcpConfig,
   type ManagedCodexMcpGateway,
 } from "./codex-home.js";
+import { digestCodexConfigForHomeIdentity } from "./codex-home.js";
+import { acquireRunLease, cleanupGeneratedCodexHomes } from "./managed-home-cleanup.js";
 import {
   CODEX_SANDBOX_AUTH_EXISTS_COMMAND,
   CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING,
@@ -681,7 +683,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const credentialBytes = await fs.readFile(path.join(credentialHome, "auth.json")).catch(() => null);
     const selectedConfig = await fs.readFile(path.join(credentialHome, "config.toml")).catch(() => null);
     // Keep selected-home provider/MCP edits (and removals) in the launched home.
-    const selectedConfigDigest = selectedConfig ? createHash("sha256").update(selectedConfig).digest("hex") : null;
+    const selectedConfigDigest = selectedConfig ? digestCodexConfigForHomeIdentity(selectedConfig.toString("utf8")) : null;
     // Copy-back may retain a refreshed regular credential in a generated home.
     // Account switches must select a different home, while token refreshes for
     // the same subscription identity preserve its cache and session state.
@@ -790,6 +792,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let sshHostHome: Awaited<ReturnType<typeof readCodexSshHostHome>> | null = null;
   let sshHostProfilePath: string | null = null;
   let sshSessionState: Awaited<ReturnType<typeof prepareCodexSshSessionState>> | null = null;
+  // Generated per-run homes are pruned when the run ends; the lease keeps this
+  // one from being pruned by a concurrent run of the same agent.
+  const generatedHome = runtimeSkillDigest && !useSshHostAuth && configuredHomeIsManaged ? configuredCodexHome : null;
+  const releaseHomeLease = generatedHome ? await acquireRunLease(generatedHome).catch(() => null) : null;
   let observabilityProfile: Awaited<ReturnType<typeof prepareCodexObservabilityProfile>> | null = null;
   let observabilityPreparationFailed = false;
   const runSshHostConfigurationCommand = async (command: string) => {
@@ -1801,5 +1807,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // written at prepare time.
     await observabilityProfile?.cleanup();
     await preparedRuntimeConfig.cleanup();
+    await releaseHomeLease?.();
+    if (generatedHome) {
+      await cleanupGeneratedCodexHomes({
+        env: process.env, companyId: agent.companyId, agentId: agent.id, currentHome: generatedHome,
+      }).catch(async (error) => {
+        await onLog("stderr", `[paperclip] Generated Codex home cleanup skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+      });
+    }
   }
 }
