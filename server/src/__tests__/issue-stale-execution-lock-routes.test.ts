@@ -13,7 +13,9 @@ import {
   heartbeatRuns,
   issueComments,
   issueRelations,
+  issueThreadInteractions,
   issues,
+  runIdentityContexts,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -22,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueService } from "../services/issues.js";
+import { initializeRunIdentity } from "../services/run-identity.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -47,7 +50,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
+    await db.delete(issueThreadInteractions);
     await db.delete(issues);
+    await db.delete(runIdentityContexts);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companyMemberships);
@@ -512,6 +517,191 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         clearAssignee: true,
       },
     });
+  });
+
+  async function seedCompanyDefaultRoot() {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const [root] = await db.insert(runIdentityContexts).values({
+      companyId,
+      runId: currentRunId,
+      revision: 1,
+      responsibleUserId: "fallback-user",
+      cause: "company_default",
+      correlationId: "dispatch",
+      acceptedAt: new Date(),
+    }).returning();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Rooted in a company default",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      originIdentityContextId: root!.id,
+      continuationIdentityContextId: root!.id,
+      responsibleUserId: "fallback-user",
+    });
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      payload: { version: 1, questions: [] },
+      sourceIdentityContextId: root!.id,
+    }).returning();
+    return { companyId, agentId, currentRunId, issueId, root: root!, interactionId: interaction!.id };
+  }
+
+  // The heartbeat derives a run's parent identity context from the task's
+  // pointers (continuation first, then origin). Mirror that to show what the
+  // next run on the task would inherit.
+  async function nextRunIdentity(companyId: string, agentId: string, issueId: string, responsibleUserId: string, cause: string) {
+    const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", invocationSource: "assignment",
+      startedAt: new Date(), contextSnapshot: { issueId } });
+    return initializeRunIdentity(db, {
+      companyId, runId, issueId, responsibleUserId, cause,
+      parentContextId: task!.continuationIdentityContextId ?? task!.originIdentityContextId,
+    });
+  }
+
+  it("restricts identity-root repair to board users of the task's company and audits the detachment", async () => {
+    const { companyId, agentId, currentRunId, issueId, root, interactionId } = await seedCompanyDefaultRoot();
+    const repair = (actor: Express.Request["actor"]) => request(createApp(actor))
+      .post(`/api/issues/${issueId}/admin/repair-identity-root`);
+
+    // An agent cannot lift the boundary its own executions are held by.
+    await repair(agentActor(companyId, agentId, currentRunId)).expect(403);
+    // Neither can an unauthenticated caller or a read-only member of the company.
+    await repair({ type: "none", source: "none" }).expect(403);
+    await repair({
+      type: "board",
+      userId: "viewer-user",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "viewer", status: "active" }],
+      isInstanceAdmin: false,
+      source: "session",
+    }).expect(403);
+    // A board user of another company cannot even learn the task exists.
+    await repair({
+      type: "board",
+      userId: "outside-user",
+      companyIds: [randomUUID()],
+      memberships: [],
+      isInstanceAdmin: false,
+      source: "session",
+    }).expect(404);
+    const [untouched] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(untouched).toMatchObject({ originIdentityContextId: root.id, continuationIdentityContextId: root.id, responsibleUserId: "fallback-user" });
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.admin_repair_identity_root"))).toEqual([]);
+
+    const res = await repair(boardActor(companyId)).send();
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      issueId,
+      detachedOrigin: true,
+      detachedContinuation: true,
+      detachedInteractionIds: [interactionId],
+      clearedResponsibleUserId: true,
+      detachedContextIds: [root.id],
+    });
+
+    const [repaired] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(repaired.originIdentityContextId).toBeNull();
+    expect(repaired.continuationIdentityContextId).toBeNull();
+    expect(repaired.responsibleUserId).toBeNull();
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(card.sourceIdentityContextId).toBeNull();
+    // The context itself survives: the fallback execution happened, and who was
+    // accountable for it is not the repair's to erase.
+    const [context] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, root.id));
+    expect(context).toMatchObject({ cause: "company_default", responsibleUserId: "fallback-user" });
+
+    const audit = await db
+      .select({ action: activityLog.action, actorId: activityLog.actorId, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.admin_repair_identity_root"));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
+      actorId: "board-user",
+      details: { issueId, actorUserId: "board-user", detachedOrigin: true },
+    });
+
+    // Re-running is safe and reports nothing left to detach.
+    const again = await repair(boardActor(companyId)).send().expect(200);
+    expect(again.body).toMatchObject({
+      detachedOrigin: false, detachedContinuation: false, detachedInteractionIds: [],
+      clearedResponsibleUserId: false, detachedContextIds: [],
+    });
+  });
+
+  it("lets the next run on a repaired task decide its identity fresh instead of inheriting company default", async () => {
+    const { companyId, agentId, issueId, root } = await seedCompanyDefaultRoot();
+
+    // Before repair: even with an attributable seed, the next run inherits the
+    // poisoned root and stays company_default.
+    const before = await nextRunIdentity(companyId, agentId, issueId, "parent-user", "dispatch");
+    expect(before).toMatchObject({ parentContextId: root.id, cause: "company_default", responsibleUserId: "fallback-user" });
+
+    await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/admin/repair-identity-root`).send().expect(200);
+
+    // After repair: the next run has no inherited root, so its own seed decides,
+    // and the run after that continues from the clean context.
+    const after = await nextRunIdentity(companyId, agentId, issueId, "parent-user", "dispatch");
+    expect(after).toMatchObject({ parentContextId: null, cause: "dispatch", responsibleUserId: "parent-user" });
+    const following = await nextRunIdentity(companyId, agentId, issueId, "parent-user", "dispatch");
+    expect(following).toMatchObject({ parentContextId: after.id, cause: "dispatch", responsibleUserId: "parent-user" });
+  });
+
+  it("re-roots a repaired task in company default when its next run still has nobody to attribute", async () => {
+    const { companyId, agentId, issueId, root } = await seedCompanyDefaultRoot();
+    await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/admin/repair-identity-root`).send().expect(200);
+
+    // Repair grants nothing by itself: a seed that still reaches the company
+    // fallback is company_default again, with a fresh root of its own...
+    const stillFallback = await nextRunIdentity(companyId, agentId, issueId, "fallback-user", "company_default");
+    expect(stillFallback).toMatchObject({ parentContextId: null, cause: "company_default" });
+    expect(stillFallback.id).not.toBe(root.id);
+    // ...and that fresh context becomes the task's continuation pointer, so a
+    // later run inherits company_default again even with an attributable seed.
+    const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(task!.continuationIdentityContextId).toBe(stillFallback.id);
+    const later = await nextRunIdentity(companyId, agentId, issueId, "parent-user", "dispatch");
+    expect(later).toMatchObject({ parentContextId: stillFallback.id, cause: "company_default" });
+  });
+
+  it("does not root or attribute an agent-created task in the creator's company-default identity", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    await db.insert(authUsers).values({ id: "fallback-user", name: "Fallback", email: "fallback@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "fallback-user", status: "active", membershipRole: "member" });
+    const createAs = async (cause: string) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", invocationSource: "assignment", startedAt: new Date() });
+      const context = await initializeRunIdentity(db, { companyId, runId, responsibleUserId: "fallback-user", cause });
+      // These are the fields the authentication middleware derives from the
+      // run's accepted identity context.
+      const actor = { ...agentActor(companyId, agentId, runId), identityContextId: context.id, onBehalfOfUserId: "fallback-user",
+        onBehalfOfMemberships: [{ companyId, membershipRole: "member", status: "active" }] };
+      const res = await request(createApp(actor))
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: `Created under ${cause}`, status: "backlog" });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const [created] = await db.select().from(issues).where(eq(issues.id, res.body.id));
+      return { context, created: created! };
+    };
+
+    const fallback = await createAs("company_default");
+    expect(fallback.context.cause).toBe("company_default");
+    expect(fallback.created.originIdentityContextId).toBeNull();
+    expect(fallback.created.responsibleUserId).toBeNull();
+
+    // Control: an attributable creator still roots and attributes the task.
+    const attributed = await createAs("dispatch");
+    expect(attributed.created.originIdentityContextId).toBe(attributed.context.id);
+    expect(attributed.created.responsibleUserId).toBe("fallback-user");
   });
 
   it("self-heals a stale checkoutRunId via clearCheckoutRunIfTerminal on checkout (Fix B path)", async () => {

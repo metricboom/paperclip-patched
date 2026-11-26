@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, documents, heartbeatRuns, issueComments, issueThreadInteractions, issueWorkProducts, issues,
+import { agents, authUsers, companies, companyMemberships, createDb, documents, heartbeatRuns, issueComments, issueThreadInteractions, issueWorkProducts, issues,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { buildAgentMentionHref } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -12,6 +12,7 @@ import { buildHostServices } from "../services/plugin-host-services.js";
 import { withPluginInteractionOrigin } from "../services/plugin-interaction-context.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
+import { initializeRunIdentity } from "../services/run-identity.js";
 
 describe("agent interaction mutation boundaries", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -134,6 +135,58 @@ describe("agent interaction mutation boundaries", () => {
     } })).rejects.toMatchObject(denied("canReceiveAssignmentsFromAgents"));
     expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId))).toHaveLength(1);
     expect(wakes).not.toHaveBeenCalled();
+  });
+
+  it("keeps a company-default runner execution from rooting or attributing the tasks it creates", async () => {
+    const createUnder = async (cause: string) => {
+      const f = await seed(), runId = randomUUID(), wakes = vi.fn();
+      await db.update(issues).set({ assigneeAgentId: f.sender, status: "in_progress" }).where(eq(issues.id, f.issueId));
+      await db.update(agents).set({ adapterType: "paperclip_runner", status: "active" }).where(eq(agents.id, f.sender));
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.sender,
+        status: "running", runtimeMode: "native", nativeIssueId: f.issueId,
+        invocationSource: "assignment", triggerDetail: "system", contextSnapshot: { issueId: f.issueId } });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
+      await db.insert(authUsers).values({ id: "fallback-user", name: "Fallback", email: "fallback@example.test",
+        createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "fallback-user",
+        status: "active", membershipRole: "member" });
+      const context = await initializeRunIdentity(db, { companyId: f.companyId, runId, issueId: f.issueId,
+        responsibleUserId: "fallback-user", cause });
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, agentId: f.sender,
+        issueId: f.issueId, runId, enqueueWakeup: wakes });
+      await authority.execute({ tool: "create_task", callId: randomUUID(), arguments: {
+        idempotencyKey: `created-under-${cause}`, title: `Created under ${cause}`, status: "backlog",
+      } });
+      const [created] = await db.select().from(issues)
+        .where(and(eq(issues.companyId, f.companyId), eq(issues.title, `Created under ${cause}`)));
+      return { context, created: created! };
+    };
+
+    const fallback = await createUnder("company_default");
+    expect(fallback.context.cause).toBe("company_default");
+    expect(fallback.created.responsibleUserId).toBeNull();
+    expect(fallback.created.originIdentityContextId).toBeNull();
+    expect(fallback.created.continuationIdentityContextId).toBeNull();
+
+    // Control: an attributable execution still roots and attributes its task.
+    const attributed = await createUnder("dispatch");
+    expect(attributed.created.responsibleUserId).toBe("fallback-user");
+    expect(attributed.created.originIdentityContextId).toBe(attributed.context.id);
+    expect(attributed.created.continuationIdentityContextId).toBe(attributed.context.id);
+  });
+
+  it("does not copy a company-default creator's responsible user onto a task created through the issue service", async () => {
+    const createWith = async (actorIdentityIsCompanyDefault: boolean) => {
+      const f = await seed(), runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.sender,
+        status: "running", responsibleUserId: "fallback-user", contextSnapshot: { issueId: f.issueId } });
+      return issueService(db).create(f.companyId, { title: "Service-created", status: "backlog",
+        createdByAgentId: f.sender, actorRunId: runId, actorResponsibleUserId: "fallback-user",
+        actorIdentityIsCompanyDefault });
+    };
+    // Neither the explicit actor user nor the actor run's user may be copied.
+    expect((await createWith(true)).responsibleUserId).toBeNull();
+    expect((await createWith(false)).responsibleUserId).toBe("fallback-user");
   });
 
   it("treats an agent-addressed review as assignment even when task ownership stays unchanged", async () => {

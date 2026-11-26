@@ -1164,6 +1164,47 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     expect((await access.getConnection(f.connection.id, f.company.id))?.config?.mcpAgentAccessConfigured).toBe(true);
   });
 
+  it("never reports GitHub ready while the credential path withholds the identity for a company-default run", async () => {
+    const f = await accessFixture("github");
+    await db.update(connectionGrants).set({ kind: "user", subjectUserId: "grant-user" })
+      .where(eq(connectionGrants.connectionId, f.connection.id));
+    await toolAccessService(db).finishGalleryAppConnection(f.company.id, f.connection.id, {
+      enabledCatalogEntryIds: f.catalog.map(tool => tool.id), askFirstCatalogEntryIds: [], access: "all_agents",
+    }, { actorType: "user", actorId: "grant-user" });
+    // The credential path's own selection for this run: the company-default
+    // responsible user is nulled and standing delegation is off.
+    const credentialSelection = (context: { cause: string; responsibleUserId: string | null }) =>
+      resolveManagedGitHubIdentitySelection(db, f.company.id, {
+        agentId: f.agent.id, responsibleUserId: context.cause === "company_default" ? null : context.responsibleUserId,
+        allowStandingDelegation: false,
+      });
+
+    const fallback = await initializeRunIdentity(db, { companyId: f.company.id, runId: f.claims.run_id, issueId: f.issue.id,
+      responsibleUserId: "grant-user", cause: "company_default" });
+    expect(fallback.cause).toBe("company_default");
+    const withheld = await credentialSelection(fallback);
+    expect(withheld).toMatchObject({ error: "No managed GitHub identity is available for this run" });
+    expect(withheld.grant).toBeUndefined();
+    const searched = (await f.service.search(f.claims, "github")).results.find(result => result.service === "github");
+    expect(searched).toBeDefined();
+    expect(searched!.state).not.toBe("ready");
+    expect(searched).toMatchObject({ state: "needs_user_action", connectionId: null });
+    expect(searched!.reason).toContain("no attributable responsible user");
+    expect((await f.service.request(f.claims, "github")).state).not.toBe("ready");
+
+    // Control: the same agent, connection and person under an attributable
+    // cause is ready, and so is the credential path.
+    const [attributedRun] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id, status: "running",
+      responsibleUserId: "grant-user", contextSnapshot: { issueId: f.issue.id } }).returning();
+    const attributed = await initializeRunIdentity(db, { companyId: f.company.id, runId: attributedRun.id, issueId: f.issue.id,
+      responsibleUserId: "grant-user", cause: "dispatch" });
+    expect(attributed.cause).toBe("dispatch");
+    await expect(credentialSelection(attributed)).resolves.toMatchObject({ configured: true, grant: { connectionId: f.connection.id } });
+    const attributedClaims = { ...f.claims, run_id: attributedRun.id };
+    expect((await f.service.search(attributedClaims, "github")).results.find(result => result.service === "github"))
+      .toMatchObject({ state: "ready", connectionId: f.connection.id });
+  });
+
   it("keeps installations with a separate narrow profile when account completion is additive", async () => {
     const f = await accessFixture("github");
     const access = toolAccessService(db);
