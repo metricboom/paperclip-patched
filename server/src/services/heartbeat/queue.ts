@@ -200,7 +200,7 @@ import { readContinuationAttempt } from "../recovery/index.js";
 import { AI_CONNECTION_POOL_WAIT_RETRY_REASON, allowsDependencyBlockedWake, extractWakeCommentIds, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { releaseProviderLimitWaits } from "./provider-limit-wait.js";
 import { dispatchForAgent, outsideAgentDispatch } from "../agent-start-lock.js";
-import { AgentRunSlotsFull, HostRunSlotsFull, assertAgentRunSlotFree, hostRunProfile } from "./run-slot-admission.js";
+import { AgentRunSlotsFull, HostRunOrderingRefused, HostRunSlotsFull, assertAgentRunSlotFree, hostRunProfile } from "./run-slot-admission.js";
 import {
   evaluateAgentInvokability,
   shouldCancelRunsForNonInvokableAgent,
@@ -1026,7 +1026,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     companyAgents?: AgentOrgRow[],
     deferredPostCommitEffects?: WakeQueuePostCommitEffect[],
     deferredCancellations?: Array<() => Promise<void>>,
-    slots?: { full: boolean },
+    slots?: { full: boolean; ordered?: boolean },
   ) {
     if (run.status !== "queued") return run;
     // Every start path ends here (dispatch passes, executeRun of a queued run,
@@ -1820,6 +1820,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 if (slots) slots.full = true;
                 return { kind: "stale" as const, run: null };
               }
+              if (error instanceof HostRunOrderingRefused) {
+                if (slots) slots.ordered = true;
+                return { kind: "stale" as const, run: null };
+              }
               throw error;
             })
         : null;
@@ -1908,6 +1912,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (error instanceof RunAdmissionClosedDuringClaim) return null;
           if (error instanceof AgentRunSlotsFull || error instanceof HostRunSlotsFull) {
             if (slots) slots.full = true;
+            return null;
+          }
+          if (error instanceof HostRunOrderingRefused) {
+            if (slots) slots.ordered = true;
             return null;
           }
           throw error;
@@ -2651,11 +2659,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const dispatcher = await queuedRunDispatcherForAgent(agent, queuedRuns, dependencyReadiness, issueById);
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      const slots = { full: false };
+      const slots: { full: boolean; ordered: boolean } = { full: false, ordered: false };
       let claimAttempts = 0;
       const triedThisPass: string[] = [];
       for (let candidate = dispatcher.next(); candidate; candidate = dispatcher.next()) {
-        if (claimedRuns.length >= availableSlots || slots.full || isRunAdmissionClosed() || signal.aborted) break;
+        if (claimedRuns.length >= availableSlots || slots.full || slots.ordered || isRunAdmissionClosed() || signal.aborted) break;
         const taskStamp = queuedRunTaskStamp(candidate, issueById);
         if (triedRunIds.has(candidate.id) || (!retryRefused && claimBackedOff(candidate.id, new Date(), taskStamp))) continue;
         if (claimAttempts >= QUEUED_RUN_CLAIM_ATTEMPTS_PER_PASS) {
@@ -2693,7 +2701,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
         if (!claimed) {
           await start.release();
-          if (slots.full) break;
+          if (slots.full || slots.ordered) break;
           noteDeclinedAgedClaim(candidate, "claim_declined");
           backOffClaim(candidate, dispatcher.personRun(candidate), taskStamp);
           continue;

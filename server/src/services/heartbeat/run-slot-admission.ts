@@ -18,6 +18,14 @@ export class HostRunSlotsFull extends Error {
   }
 }
 
+/** A run that is not the oldest queued local run on this host may not start yet. This is an ordering refusal, not a full host. */
+export class HostRunOrderingRefused extends Error {
+  constructor(readonly hostId: string, readonly headRunId: string) {
+    super("This host starts local runs in queue order, and an older local run is waiting.");
+    this.name = "HostRunOrderingRefused";
+  }
+}
+
 function hostRunLimit() {
   const parsed = Number.parseInt(process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS ?? "", 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
@@ -35,7 +43,14 @@ type ClaimingRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | 
 
 export async function assertAgentRunSlotFree(tx: Pick<Db, "select" | "execute">, run: ClaimingRun) {
   const hostLimit = hostRunLimit();
-  if (hostLimit !== null) {
+  // The host cap only applies to runs that execute on this host. Same convention as the
+  // queue and running counts below: the claiming agent's default environment decides, and
+  // an agent with no default environment counts as local.
+  const [claimingEnvironment] = hostLimit === null ? [] : await tx.select({ driver: environments.driver }).from(agents)
+    .leftJoin(environments, eq(environments.id, agents.defaultEnvironmentId))
+    .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId))).limit(1);
+  const claimsRemotely = claimingEnvironment?.driver != null && claimingEnvironment.driver !== "local";
+  if (hostLimit !== null && !claimsRemotely) {
     const hostId = configuredHostRunId();
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:host-local-runs:${hostId}`}, 0))`);
     const [head] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
@@ -43,7 +58,7 @@ export async function assertAgentRunSlotFree(tx: Pick<Db, "select" | "execute">,
       .leftJoin(environments, eq(environments.id, agents.defaultEnvironmentId))
       .where(and(eq(heartbeatRuns.status, "queued"), or(isNull(agents.defaultEnvironmentId), eq(environments.driver, "local"))))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
-    if (head && head.id !== run.id) throw new HostRunSlotsFull(hostId, hostLimit, hostLimit);
+    if (head && head.id !== run.id) throw new HostRunOrderingRefused(hostId, head.id);
     const [runningOnHost] = await tx.select({ count: sql<number>`count(*)::int` }).from(heartbeatRuns)
       .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
       .leftJoin(environments, eq(environments.id, agents.defaultEnvironmentId))

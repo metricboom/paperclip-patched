@@ -21,6 +21,38 @@ export function readLocalRunCpuControl(runtimeConfig: unknown): LocalRunCpuContr
 export function configureLocalRunCpuControl(runId: string, control: LocalRunCpuControl | null) { if (control) controls.set(runId, control); else controls.delete(runId); }
 export function clearLocalRunCpuControl(runId: string) { controls.delete(runId); }
 export function takeLocalRunCpuAccounting(runId: string) { const accounting = completed.get(runId) ?? null; completed.delete(runId); return accounting; }
+const addNullable = (a: number | null, b: number | null) => a === null && b === null ? null : (a ?? 0) + (b ?? 0);
+const methodRank = { none: 0, nice: 1, cgroup_v2: 2 } as const;
+/**
+ * One run can spawn several child processes (retries, helper commands). Each child reports its own
+ * accounting; the run's record is the sum. CPU seconds add up, with an unknown (null) side counting as
+ * zero unless both sides are unknown. wallSeconds is the longest single child, because children may
+ * overlap and adding their wall time would overstate it. quality is exact only if every child was exact.
+ * Control: strongest method wins (cgroup_v2 over nice over none), quotaEnforced only if every child
+ * enforced it, and distinct fallback reasons are joined.
+ */
+export function mergeLocalRunCpuAccounting(previous: LocalRunCpuAccounting | null, next: LocalRunCpuAccounting): LocalRunCpuAccounting {
+  if (!previous) return next;
+  const reasons = [...new Set([previous.control.fallbackReason, next.control.fallbackReason]
+    .flatMap(reason => reason ? reason.split("; ") : []))];
+  const appliedNice = previous.control.appliedNice ?? next.control.appliedNice;
+  return {
+    schema: next.schema, scope: next.scope,
+    quality: previous.quality === "exact_cgroup_v2" && next.quality === "exact_cgroup_v2" ? "exact_cgroup_v2" : "approximate_proc_group",
+    userCpuSeconds: addNullable(previous.userCpuSeconds, next.userCpuSeconds),
+    systemCpuSeconds: addNullable(previous.systemCpuSeconds, next.systemCpuSeconds),
+    cpuSeconds: addNullable(previous.cpuSeconds, next.cpuSeconds),
+    wallSeconds: Math.max(previous.wallSeconds, next.wallSeconds),
+    control: {
+      requestedQuotaPercent: previous.control.requestedQuotaPercent ?? next.control.requestedQuotaPercent,
+      requestedNice: previous.control.requestedNice ?? next.control.requestedNice,
+      method: methodRank[next.control.method] > methodRank[previous.control.method] ? next.control.method : previous.control.method,
+      quotaEnforced: previous.control.quotaEnforced && next.control.quotaEnforced,
+      ...(reasons.length ? { fallbackReason: reasons.join("; ") } : {}),
+      ...(appliedNice !== undefined ? { appliedNice } : {}),
+    },
+  };
+}
 function cpuStat(text: string) {
   const values = Object.fromEntries(text.split("\n").flatMap(line => { const [key, value] = line.trim().split(/\s+/, 2); return key && value && /^\d+$/.test(value) ? [[key, Number(value)]] : []; }));
   return typeof values.usage_usec === "number" ? { usage: values.usage_usec, user: values.user_usec ?? null, system: values.system_usec ?? null } : null;
@@ -65,6 +97,7 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
       const end = processGroupId ? await processGroupCpu(processGroupId) : sampled, userCpuSeconds = Math.max(sampled.user, end.user) / PROC_TICKS_PER_SECOND, systemCpuSeconds = Math.max(sampled.system, end.system) / PROC_TICKS_PER_SECOND;
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
-    completed.set(runId, result); return result;
+    const merged = mergeLocalRunCpuAccounting(completed.get(runId) ?? null, result);
+    completed.set(runId, merged); return merged;
   };
 }
