@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { beginLocalRunCpuAccounting } from "./local-run-cpu.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -4930,6 +4931,9 @@ export async function runChildProcess(
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
+        const cpuAccounting = child.pid && !opts.remoteExecution
+          ? beginLocalRunCpuAccounting(runId, child.pid, processGroupId).catch(() => null)
+          : null;
 
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
@@ -5112,6 +5116,7 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
+          void cpuAccounting?.then(finish => finish?.());
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -5134,6 +5139,7 @@ export async function runChildProcess(
             runningProcesses.delete(runId);
             void logChain.finally(() => {
               void Promise.resolve()
+                .then(() => cpuAccounting?.then(finish => finish?.()))
                 .then(() => target.cleanup?.())
                 .finally(() => {
                   resolve({
