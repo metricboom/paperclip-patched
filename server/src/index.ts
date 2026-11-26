@@ -92,6 +92,7 @@ import { instrumentationReady, shutdownInstrumentation } from "./instrumentation
 import { controllerInstanceLeaseEnabled, registerControllerInstanceDb, registerControllerInstanceLeaseWork,
   stopControllerInstanceLease } from "./services/controller-instance-lease.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
+import { installTransportErrorGuard } from "./transport-error-guard.js";
 import { setSentryRunLinkResolver } from "./sentry-links.js";
 import { createSentryRunLinkResolver } from "./services/sentry-run-links.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
@@ -312,7 +313,31 @@ function initializeRuntimeConfigConsumers(config: ReturnType<typeof loadConfig>)
   }
 }
 
+let uncaughtFatalStarted = false;
+
+/**
+ * The exit an uncaught exception would have produced without a listener:
+ * print the stack, then exit 1. Sentry is flushed first because the guard
+ * replaces the SDK's own uncaught-exception exit (see `sentry.ts`).
+ */
+function exitOnUncaughtException(error: unknown): void {
+  if (uncaughtFatalStarted) return;
+  uncaughtFatalStarted = true;
+  // eslint-disable-next-line no-console
+  console.error(error);
+  // Never let a stuck flush keep a broken process serving.
+  setTimeout(() => process.exit(1), 10_000);
+  void shutdownSentry().finally(() => process.exit(1));
+}
+
 export async function startServer(): Promise<StartedServer> {
+  // A peer that closes one connection mid-write must fail that operation,
+  // not the server. Every other uncaught exception still exits.
+  installTransportErrorGuard({
+    capture: (error) => captureException(error),
+    warn: (details, message) => logger.warn(details, message),
+    fatal: exitOnUncaughtException,
+  });
   const startupDatabase: StartupDatabaseTeardown = { close: null };
   try {
     return await startServerWithDatabaseTeardown(startupDatabase);
