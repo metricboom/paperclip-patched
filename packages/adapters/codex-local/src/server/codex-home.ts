@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -980,4 +981,24 @@ export async function evaluateCodexCredentialReadiness(
     (await codexHomeHasUsableAuth(effectiveHome)) ||
     (await codexHomeHasUsableAuth(sharedSourceHome));
   return { managed: true, authMode: "subscription", ready, effectiveHome, sharedSourceHome };
+}
+
+/**
+ * Digest of a selected home's `config.toml` for the generated-home identity.
+ * The Codex binary appends per-project trust (`[projects."<cwd>"]`) to the
+ * config it runs with, and Paperclip rewrites its managed MCP block (per-run
+ * bearer tokens) into it. Both change without the operator changing anything,
+ * so they must not select a new home. Provider/MCP edits made by the operator
+ * still change the digest.
+ */
+export function digestCodexConfigForHomeIdentity(config: string): string {
+  const withoutManaged = stripManagedMcpBlock(config);
+  const kept: string[] = [];
+  let skipping = false;
+  for (const line of withoutManaged.split(/\r?\n/)) {
+    const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line);
+    if (header) skipping = /^projects(\.|$)/.test(header[1]!);
+    if (!skipping) kept.push(line.trimEnd());
+  }
+  return createHash("sha256").update(kept.join("\n").trim()).digest("hex");
 }
