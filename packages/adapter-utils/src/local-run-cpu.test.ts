@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalRunCpuControl, takeLocalRunCpuAccounting, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -51,6 +51,36 @@ describe("local run CPU controls", () => {
     await finish();
     expect(takeLocalRunCpuAccounting("cpu-registered")).not.toBeNull();
     expect(takeLocalRunCpuAccounting("cpu-registered")).toBeNull();
+  });
+
+  it("samples the descendant tree when no process group exists (the ACP spawn shape)", async () => {
+    if (process.platform !== "linux") return;
+    const { spawn } = await import("node:child_process");
+    // Not detached: the child shares this process's group, as an ACPX-spawned agent does.
+    const child = spawn(process.execPath, ["-e", "const c = require('node:child_process').spawn(process.execPath, ['-e', 'const e = Date.now() + 900; while (Date.now() < e);'], { stdio: 'ignore' }); const e = Date.now() + 900; while (Date.now() < e);"], { stdio: "ignore" });
+    try {
+      await new Promise((resolve) => child.on("spawn", resolve));
+      const finish = await beginLocalRunCpuAccounting("cpu-tree", child.pid!, null);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const accounting = await finish();
+      expect(accounting.cpuSeconds).toBeGreaterThan(0.1);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("verifies a process identity token before attaching to an unspawned pid", async () => {
+    if (process.platform !== "linux") return;
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2_000)"], { stdio: "ignore" });
+    try {
+      await new Promise((resolve) => child.on("spawn", resolve));
+      expect(await verifyLocalProcessIdentity(child.pid!, new Date().toISOString())).toBe(true);
+      expect(await verifyLocalProcessIdentity(child.pid!, new Date("2000-01-01T00:00:00Z").toISOString())).toBe(false);
+      expect(await verifyLocalProcessIdentity(child.pid!, "not-a-date")).toBe(false);
+    } finally {
+      child.kill("SIGKILL");
+    }
   });
 
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {

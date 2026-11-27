@@ -88,14 +88,58 @@ function cpuStat(text: string) {
 }
 function procStat(text: string) {
   const close = text.lastIndexOf(") "); if (close < 0) return null;
-  const fields = text.slice(close + 2).trim().split(/\s+/), pgrp = Number(fields[2]), user = Number(fields[11]), system = Number(fields[12]);
-  return Number.isFinite(pgrp) && Number.isFinite(user) && Number.isFinite(system) ? { pgrp, user, system } : null;
+  const fields = text.slice(close + 2).trim().split(/\s+/), ppid = Number(fields[1]), pgrp = Number(fields[2]), user = Number(fields[11]), system = Number(fields[12]), starttime = Number(fields[19]);
+  return Number.isFinite(pgrp) && Number.isFinite(user) && Number.isFinite(system) ? { ppid, pgrp, user, system, starttime } : null;
+}
+async function procStats() {
+  if (process.platform !== "linux") return [];
+  const entries = await fs.readdir("/proc", { withFileTypes: true }).catch(() => []);
+  const stats = await Promise.all(entries.filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name)).map(async entry => {
+    const stat = procStat(await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => ""));
+    return stat ? { pid: Number(entry.name), ...stat } : null;
+  }));
+  return stats.filter(stat => stat !== null);
 }
 async function processGroupCpu(processGroupId: number) {
-  if (process.platform !== "linux") return { user: 0, system: 0 };
-  const entries = await fs.readdir("/proc", { withFileTypes: true }).catch(() => []);
-  const samples = await Promise.all(entries.filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name)).map(async entry => procStat(await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => ""))));
-  return samples.reduce((total, sample) => sample && sample.pgrp === processGroupId ? { user: total.user + sample.user, system: total.system + sample.system } : total, { user: 0, system: 0 });
+  const samples = await procStats();
+  return samples.reduce((total, sample) => sample.pgrp === processGroupId ? { user: total.user + sample.user, system: total.system + sample.system } : total, { user: 0, system: 0 });
+}
+// Descendant-tree sampling for processes that share their parent's process group (the ACP spawn
+// path): a pid belongs to the tree when walking ppid reaches the root. This cannot include the
+// server or other host processes, which are ancestors, never descendants. Two measured limits:
+// a child that double-forks into a new session is reparented out of the tree, and a child that
+// exits between samples contributes only up to its last sample.
+async function processTreeCpu(rootPid: number) {
+  const samples = await procStats();
+  const ppidOf = new Map(samples.map(sample => [sample.pid, sample.ppid]));
+  const inTree = (pid: number) => {
+    let current: number | undefined = pid;
+    for (let depth = 0; depth < 64 && current !== undefined; depth += 1) {
+      if (current === rootPid) return true;
+      if (current === 0) return false;
+      current = ppidOf.get(current);
+    }
+    return false;
+  };
+  return samples.reduce((total, sample) => inTree(sample.pid) ? { user: total.user + sample.user, system: total.system + sample.system } : total, { user: 0, system: 0 });
+}
+// PID reuse guard: /proc/<pid>/stat starttime (clock ticks since boot) against /proc/stat btime
+// gives the process's boot-based start epoch. Compare with the spawn identity's recorded
+// startedAt before attaching any control to a pid the caller did not just spawn (warm reuse);
+// a recycled pid fails the match.
+export async function verifyLocalProcessIdentity(pid: number, startedAt: string): Promise<boolean> {
+  if (process.platform !== "linux") return true;
+  const expected = Date.parse(startedAt);
+  if (!Number.isFinite(expected)) return false;
+  const [statText, procBase] = await Promise.all([
+    fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => ""),
+    fs.readFile("/proc/stat", "utf8").catch(() => ""),
+  ]);
+  const stat = procStat(statText);
+  const btime = Number(/\bbtime (\d+)/.exec(procBase)?.[1]);
+  if (!stat || !Number.isFinite(stat.starttime) || !Number.isFinite(btime)) return false;
+  const startEpochMs = (btime + stat.starttime / PROC_TICKS_PER_SECOND) * 1_000;
+  return Math.abs(startEpochMs - expected) <= 2_000;
 }
 async function tryCreateCgroup(runId: string, pid: number, quotaPercent: number) {
   if (process.platform !== "linux") throw new Error("cgroup v2 is only available on Linux");
@@ -112,8 +156,11 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
   if (requested.quotaPercent !== null) try { cgroup = await tryCreateCgroup(runId, pid, requested.quotaPercent); } catch (error) { fallbackReason = error instanceof Error ? error.message : String(error); }
   const desiredNice = requested.nice ?? (requested.quotaPercent !== null && !cgroup ? 10 : null);
   if (desiredNice !== null) try { os.setPriority(pid, desiredNice); appliedNice = desiredNice; } catch (error) { fallbackReason = [fallbackReason, error instanceof Error ? error.message : String(error)].filter(Boolean).join("; "); }
-  let sampled = processGroupId ? await processGroupCpu(processGroupId) : { user: 0, system: 0 };
-  const sampler = processGroupId ? setInterval(() => { void processGroupCpu(processGroupId).then(next => { sampled = next; }); }, 250) : null; sampler?.unref();
+  // No process group (the ACP spawn path): sample the process's descendant tree instead. See
+  // processTreeCpu for the tree membership rule and its measured limits.
+  const sample = processGroupId ? () => processGroupCpu(processGroupId) : () => processTreeCpu(pid);
+  let sampled = await sample();
+  const sampler = setInterval(() => { void sample().then(next => { sampled = next; }); }, 250); sampler.unref();
   return async () => {
     if (sampler) clearInterval(sampler); const wallSeconds = (Date.now() - startedAt) / 1_000;
     let result: LocalRunCpuAccounting;
@@ -123,7 +170,7 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
       await fs.rmdir(cgroup.directory).catch(() => undefined);
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
-      const end = processGroupId ? await processGroupCpu(processGroupId) : sampled, userCpuSeconds = Math.max(sampled.user, end.user) / PROC_TICKS_PER_SECOND, systemCpuSeconds = Math.max(sampled.system, end.system) / PROC_TICKS_PER_SECOND;
+      const end = await sample(), userCpuSeconds = Math.max(sampled.user, end.user) / PROC_TICKS_PER_SECOND, systemCpuSeconds = Math.max(sampled.system, end.system) / PROC_TICKS_PER_SECOND;
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
     const merged = mergeLocalRunCpuAccounting(completed.get(runId)?.accounting ?? null, result);
