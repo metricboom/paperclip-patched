@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -75,9 +75,34 @@ describe("local run CPU controls", () => {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2_000)"], { stdio: "ignore" });
     try {
       await new Promise((resolve) => child.on("spawn", resolve));
-      expect(await verifyLocalProcessIdentity(child.pid!, new Date().toISOString())).toBe(true);
-      expect(await verifyLocalProcessIdentity(child.pid!, new Date("2000-01-01T00:00:00Z").toISOString())).toBe(false);
-      expect(await verifyLocalProcessIdentity(child.pid!, "not-a-date")).toBe(false);
+      // The trusted spawn path captures the kernel starttime while the child handle is live;
+      // later attachment compares that exact value. A wrong token, a recycled pid, and an older
+      // warm entry with no token at all must all fail the match.
+      const token = await readLocalProcessStarttime(child.pid!);
+      expect(token).not.toBeNull();
+      expect(await verifyLocalProcessIdentity(child.pid!, token)).toBe(true);
+      expect(await verifyLocalProcessIdentity(child.pid!, (token ?? 0) + 1)).toBe(false);
+      expect(await verifyLocalProcessIdentity(child.pid!, null)).toBe(false);
+      expect(await verifyLocalProcessIdentity(child.pid!, undefined)).toBe(false);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("preserves CPU already observed for a descendant that exits before the run ends", async () => {
+    if (process.platform !== "linux") return;
+    const { spawn } = await import("node:child_process");
+    // The child spawns a CPU-heavy grandchild that exits after ~900 ms, then idles past another
+    // sampling interval. Without per-PID high-water accumulation the later samples no longer see
+    // the exited grandchild and its observed CPU is discarded (the finding reported ~0.16 s for
+    // this shape). With accumulation the observed work survives the exit.
+    const child = spawn(process.execPath, ["-e", "const c = require('node:child_process').spawn(process.execPath, ['-e', 'const e = Date.now() + 900; while (Date.now() < e);'], { stdio: 'ignore' }); setTimeout(() => {}, 2_000);"], { stdio: "ignore" });
+    try {
+      await new Promise((resolve) => child.on("spawn", resolve));
+      const finish = await beginLocalRunCpuAccounting("cpu-exit", child.pid!, null);
+      await new Promise((resolve) => setTimeout(resolve, 1_600));
+      const accounting = await finish();
+      expect(accounting.cpuSeconds).toBeGreaterThan(0.4);
     } finally {
       child.kill("SIGKILL");
     }

@@ -100,16 +100,10 @@ async function procStats() {
   }));
   return stats.filter(stat => stat !== null);
 }
-async function processGroupCpu(processGroupId: number) {
-  const samples = await procStats();
-  return samples.reduce((total, sample) => sample.pgrp === processGroupId ? { user: total.user + sample.user, system: total.system + sample.system } : total, { user: 0, system: 0 });
+async function processGroupRows(processGroupId: number) {
+  return (await procStats()).filter(sample => sample.pgrp === processGroupId);
 }
-// Descendant-tree sampling for processes that share their parent's process group (the ACP spawn
-// path): a pid belongs to the tree when walking ppid reaches the root. This cannot include the
-// server or other host processes, which are ancestors, never descendants. Two measured limits:
-// a child that double-forks into a new session is reparented out of the tree, and a child that
-// exits between samples contributes only up to its last sample.
-async function processTreeCpu(rootPid: number) {
+async function processTreeRows(rootPid: number) {
   const samples = await procStats();
   const ppidOf = new Map(samples.map(sample => [sample.pid, sample.ppid]));
   const inTree = (pid: number) => {
@@ -121,25 +115,25 @@ async function processTreeCpu(rootPid: number) {
     }
     return false;
   };
-  return samples.reduce((total, sample) => inTree(sample.pid) ? { user: total.user + sample.user, system: total.system + sample.system } : total, { user: 0, system: 0 });
+  return samples.filter(sample => inTree(sample.pid));
 }
-// PID reuse guard: /proc/<pid>/stat starttime (clock ticks since boot) against /proc/stat btime
-// gives the process's boot-based start epoch. Compare with the spawn identity's recorded
-// startedAt before attaching any control to a pid the caller did not just spawn (warm reuse);
-// a recycled pid fails the match.
-export async function verifyLocalProcessIdentity(pid: number, startedAt: string): Promise<boolean> {
-  if (process.platform !== "linux") return true;
-  const expected = Date.parse(startedAt);
-  if (!Number.isFinite(expected)) return false;
-  const [statText, procBase] = await Promise.all([
-    fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => ""),
-    fs.readFile("/proc/stat", "utf8").catch(() => ""),
-  ]);
-  const stat = procStat(statText);
-  const btime = Number(/\bbtime (\d+)/.exec(procBase)?.[1]);
-  if (!stat || !Number.isFinite(stat.starttime) || !Number.isFinite(btime)) return false;
-  const startEpochMs = (btime + stat.starttime / PROC_TICKS_PER_SECOND) * 1_000;
-  return Math.abs(startEpochMs - expected) <= 2_000;
+
+// PID identity token: the kernel starttime (clock ticks since boot) from /proc/<pid>/stat. A
+// caller that just spawned the process captures it with readLocalProcessStarttime while the
+// child handle is live and trusted; before attaching any control to that pid later (warm reuse),
+// verifyLocalProcessIdentity compares the SAME kernel value. A recycled pid has a different
+// starttime and fails the match. An entry without a captured token (older warm entries) matches
+// nothing: never attach to an unverified pid. Residual boundary: between the check and the
+// mutation the process can still exit and the pid recycle, so the window is narrowed by checking
+// immediately before each mutation, never eliminated.
+export async function readLocalProcessStarttime(pid: number): Promise<number | null> {
+  if (process.platform !== "linux") return null;
+  const stat = procStat(await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => ""));
+  return stat && Number.isFinite(stat.starttime) ? stat.starttime : null;
+}
+export async function verifyLocalProcessIdentity(pid: number, expectedStarttime: number | null | undefined): Promise<boolean> {
+  if (expectedStarttime === null || expectedStarttime === undefined) return false;
+  return await readLocalProcessStarttime(pid) === expectedStarttime;
 }
 async function tryCreateCgroup(runId: string, pid: number, quotaPercent: number) {
   if (process.platform !== "linux") throw new Error("cgroup v2 is only available on Linux");
@@ -156,11 +150,32 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
   if (requested.quotaPercent !== null) try { cgroup = await tryCreateCgroup(runId, pid, requested.quotaPercent); } catch (error) { fallbackReason = error instanceof Error ? error.message : String(error); }
   const desiredNice = requested.nice ?? (requested.quotaPercent !== null && !cgroup ? 10 : null);
   if (desiredNice !== null) try { os.setPriority(pid, desiredNice); appliedNice = desiredNice; } catch (error) { fallbackReason = [fallbackReason, error instanceof Error ? error.message : String(error)].filter(Boolean).join("; "); }
-  // No process group (the ACP spawn path): sample the process's descendant tree instead. See
-  // processTreeCpu for the tree membership rule and its measured limits.
-  const sample = processGroupId ? () => processGroupCpu(processGroupId) : () => processTreeCpu(pid);
-  let sampled = await sample();
-  const sampler = setInterval(() => { void sample().then(next => { sampled = next; }); }, 250); sampler.unref();
+  // Non-cgroup sampling: per-PID high-water accumulation. A process's /proc counters only rise
+  // while it lives, so keeping the highest value observed per pid preserves CPU already observed
+  // for descendants that exited before a later sample (they then disappear from /proc). Applies
+  // to both the process-group match and the process-tree match (no process group on the ACP
+  // spawn path; see processTreeRows for the tree membership rule). The baseline captured at
+  // begin is subtracted at finish, so a reused process reports only this window's work.
+  // Measured sampling limitations (not guaranteed bounds): a process that starts and exits
+  // entirely between two samples is never observed; a process reparented out of the tree stops
+  // being matched; a pid recycled within the window keeps the earlier process's higher counter
+  // and the new process's pre-recycle-relative work is missed.
+  const collectRows = processGroupId ? () => processGroupRows(processGroupId) : () => processTreeRows(pid);
+  const highWater = new Map<number, { user: number; system: number }>();
+  const sampleOnce = async () => {
+    for (const row of await collectRows()) {
+      const prev = highWater.get(row.pid);
+      highWater.set(row.pid, { user: Math.max(prev?.user ?? 0, row.user), system: Math.max(prev?.system ?? 0, row.system) });
+    }
+  };
+  const totalNow = () => {
+    let user = 0, system = 0;
+    for (const value of highWater.values()) { user += value.user; system += value.system; }
+    return { user, system };
+  };
+  await sampleOnce();
+  const baseline = totalNow();
+  const sampler = setInterval(() => { void sampleOnce(); }, 250); sampler.unref();
   return async () => {
     if (sampler) clearInterval(sampler); const wallSeconds = (Date.now() - startedAt) / 1_000;
     let result: LocalRunCpuAccounting;
@@ -170,7 +185,8 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
       await fs.rmdir(cgroup.directory).catch(() => undefined);
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
-      const end = await sample(), userCpuSeconds = Math.max(sampled.user, end.user) / PROC_TICKS_PER_SECOND, systemCpuSeconds = Math.max(sampled.system, end.system) / PROC_TICKS_PER_SECOND;
+      await sampleOnce();
+      const end = totalNow(), userCpuSeconds = Math.max(0, end.user - baseline.user) / PROC_TICKS_PER_SECOND, systemCpuSeconds = Math.max(0, end.system - baseline.system) / PROC_TICKS_PER_SECOND;
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
     const merged = mergeLocalRunCpuAccounting(completed.get(runId)?.accounting ?? null, result);
