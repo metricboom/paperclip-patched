@@ -208,6 +208,9 @@ describe("local run CPU controls", () => {
       // A plain directory has no real cgroup cpu.stat, so setup fails after containment: the
       // group must be resumed, the directory removed, and the run must fall back without
       // claiming an enforced quota.
+      // The move-back target as a directory makes the rollback write fail with a non-ESRCH
+      // error, simulating an unwritable parent cgroup.procs.
+      await fs.mkdir(path.join(root, "cgroup.procs"));
       configureLocalRunCpuControl("cpu-cgroup-fail", { nice: 10, quotaPercent: 50 });
       const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "ignore", detached: true });
       try {
@@ -217,6 +220,10 @@ describe("local run CPU controls", () => {
         expect(accounting.control.quotaEnforced).toBe(false);
         expect(accounting.quality).toBe("approximate_proc_group");
         expect(accounting.control.fallbackReason).toContain("cpu.stat");
+        // The fake root has no writable cgroup.procs at its top level, so the rollback of the
+        // moved child fails - and that failure must stay visible in the fallback reason rather
+        // than leaving a live process silently confined by the abandoned quota.
+        expect(accounting.control.fallbackReason).toContain("cgroup rollback incomplete");
         await expect(fs.stat(path.join(root, "paperclip-runs", "cpu-cgroup-fail"))).rejects.toThrow();
         const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8");
         expect(stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[0]).not.toBe("T");

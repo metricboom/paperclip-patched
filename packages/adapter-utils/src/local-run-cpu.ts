@@ -263,13 +263,23 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
 // itself; the move-back target is the delegated subtree root's cgroup.procs. Best effort: the
 // whole cleanup path tolerates failure because a leftover empty cgroup directory is retried on
 // the next finish and carries no running processes after the run's tree has exited.
+// Returns how many member moves failed (excluding ESRCH: a process that already exited needs no
+// move). Callers must surface a nonzero count: without it, a failed rollback would leave live
+// processes confined by this run's cpu.max while the run reports a nice-only fallback.
 async function releaseCgroupProcesses(directory: string) {
   const procs = await fs.readFile(`${directory}/cgroup.procs`, "utf8").catch(() => "");
   const root = process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup";
+  let failed = 0;
   for (const line of procs.split("\n")) {
     const member = line.trim();
-    if (member) await fs.writeFile(`${root}/cgroup.procs`, `${member}\n`, { flag: "a" }).catch(() => undefined);
+    if (!member) continue;
+    try {
+      await fs.writeFile(`${root}/cgroup.procs`, `${member}\n`, { flag: "a" });
+    } catch (error) {
+      if (!isBenignProcWriteError(error)) failed += 1;
+    }
   }
+  return { failed };
 }
 async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, quotaPercent: number) {
   if (process.platform !== "linux") throw new Error("cgroup v2 is only available on Linux");
@@ -281,8 +291,12 @@ async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, 
     const start = cpuStat(await fs.readFile(`${directory}/cpu.stat`, "utf8")); if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
     return { directory, start };
   } catch (error) {
-    await releaseCgroupProcesses(directory);
+    const rollback = await releaseCgroupProcesses(directory);
     await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    if (rollback.failed > 0) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`${reason}; cgroup rollback incomplete: ${rollback.failed} moved process(es) could not be moved back out of ${directory} and may still be confined by its cpu.max`);
+    }
     throw error;
   }
 }
