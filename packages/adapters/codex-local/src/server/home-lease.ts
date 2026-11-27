@@ -38,12 +38,17 @@ export const MAX_LEASE_AGE_MS = 24 * HOUR_MS;
 const CLAIM_WAIT_MS = 30_000;
 const CLAIM_POLL_MS = 20;
 
+/**
+ * False only when the pid is confirmed gone (ESRCH). Any other error - EPERM, a pid Node
+ * refuses to check (ERR_INVALID_ARG_TYPE for 2**31 and above), or anything unexpected -
+ * means the pid could not be checked, so it counts as alive (fail closed).
+ */
 export function pidIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
   }
 }
 

@@ -1,8 +1,46 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { claimHome, claimPathFor } from "./home-lease.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { claimHome, claimPathFor, homeHasLiveLease, pidIsAlive, RUN_LEASES_DIR } from "./home-lease.js";
+
+/**
+ * Only ESRCH ("no such process") proves a pid is dead. Any other error from the liveness
+ * check means the pid could not be checked, and the lease must be kept (fail closed).
+ */
+describe("pidIsAlive fails closed", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("treats a pid that process.kill rejects as uncheckable, not dead", () => {
+    // 2147483648 passes Number.isInteger and > 0, but Node throws ERR_INVALID_ARG_TYPE for it.
+    expect(pidIsAlive(2 ** 31)).toBe(true);
+  });
+
+  it("treats an unexpected kill error as alive", () => {
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("boom"), { code: "EINVAL" });
+    });
+    expect(pidIsAlive(12345)).toBe(true);
+  });
+
+  it("treats ESRCH as dead", () => {
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    });
+    expect(pidIsAlive(12345)).toBe(false);
+  });
+
+  it("a lease with an uncheckable numeric pid keeps the home", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "home-lease-pid-"));
+    try {
+      await fs.mkdir(path.join(home, RUN_LEASES_DIR));
+      await fs.writeFile(path.join(home, RUN_LEASES_DIR, "x.json"), JSON.stringify({ pid: 2 ** 31, startedAt: 0 }));
+      expect(await homeHasLiveLease(home, Date.now())).toBe(true);
+    } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+});
 
 /**
  * Fail-closed claim behavior. Claims are never stolen: a claim whose owner process is gone
