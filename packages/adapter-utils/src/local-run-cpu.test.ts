@@ -53,19 +53,26 @@ describe("local run CPU controls", () => {
     expect(takeLocalRunCpuAccounting("cpu-registered")).toBeNull();
   });
 
-  it("sweeps only retained entries whose consumer never arrives within the retention window", async () => {
+  it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-      configureLocalRunCpuControl("cpu-stale", null);
-      const finishStale = await beginLocalRunCpuAccounting("cpu-stale", process.pid, null);
-      await finishStale();
+      configureLocalRunCpuControl("cpu-long", null);
+      const finishFirst = await beginLocalRunCpuAccounting("cpu-long", process.pid, null);
+      await finishFirst();
+      configureLocalRunCpuControl("cpu-failed", null);
+      const finishFailed = await beginLocalRunCpuAccounting("cpu-failed", process.pid, null);
+      await finishFailed();
+      clearLocalRunCpuControl("cpu-failed"); // dispatch unwound before result handling took the entry
+
+      // Two hours later the long run is still dispatching: its early child's entry must survive.
       vi.setSystemTime(new Date("2026-01-01T02:00:00Z"));
-      configureLocalRunCpuControl("cpu-fresh", null);
-      const finishFresh = await beginLocalRunCpuAccounting("cpu-fresh", process.pid, null);
-      await finishFresh();
-      expect(takeLocalRunCpuAccounting("cpu-stale")).toBeNull();
-      expect(takeLocalRunCpuAccounting("cpu-fresh")).not.toBeNull();
+      const finishSecond = await beginLocalRunCpuAccounting("cpu-long", process.pid, null);
+      await finishSecond();
+
+      expect(takeLocalRunCpuAccounting("cpu-failed")).toBeNull(); // abandoned owner, grace passed
+      const longRun = takeLocalRunCpuAccounting("cpu-long");
+      expect(longRun).toMatchObject({ schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree" });
     } finally {
       vi.useRealTimers();
     }

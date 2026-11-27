@@ -11,25 +11,28 @@ export interface LocalRunCpuAccounting {
 const controls = new Map<string, LocalRunCpuControl>();
 // Runs dispatched through the heartbeat runtime register here: configureLocalRunCpuControl is
 // called for every dispatch, with a null control for remote targets, and clearLocalRunCpuControl
-// unregisters when the dispatch unwinds. Only runs inside that window have their accounting
-// retained for takeLocalRunCpuAccounting. Synthetic callers such as model discovery never
-// register, so their per-process entries are returned to the direct caller but never retained at
-// all. Entries whose consumer never arrives (a run that fails before result handling) are swept
-// after COMPLETED_RETENTION_MS, so retention is bounded by lifetime, never by volume: a
-// legitimate consumer takes its entry right after the run's result is handled, far inside the
-// window, so no real run's accounting can be evicted by other callers' activity.
+// unwinds the registration when the dispatch ends. Only runs inside that window have their
+// accounting retained for takeLocalRunCpuAccounting. Synthetic callers such as model discovery
+// never register, so their per-process entries are returned to the direct caller but never
+// retained at all.
+//
+// Cleanup is ownership-based, never expiry of live data: an entry is sweepable only once its
+// dispatch has unwound (clear ran) without the consumer taking it, plus a short grace for the
+// result handling that sits between clear and take. An entry whose dispatch is still open is
+// never swept, however old it is, so a long multi-child run cannot lose an early child's CPU.
 const registered = new Set<string>();
-const completed = new Map<string, LocalRunCpuAccounting>();
-const completedAt = new Map<string, number>();
-const COMPLETED_RETENTION_MS = 60 * 60_000;
+type CompletedEntry = { accounting: LocalRunCpuAccounting; dispatchClosedAt: number | null };
+const completed = new Map<string, CompletedEntry>();
+const DISPATCH_CLOSED_GRACE_MS = 5 * 60_000;
+function sweepCompleted(now: number) {
+  for (const [id, entry] of completed) {
+    if (entry.dispatchClosedAt !== null && now - entry.dispatchClosedAt > DISPATCH_CLOSED_GRACE_MS) completed.delete(id);
+  }
+}
 function rememberCompleted(runId: string, accounting: LocalRunCpuAccounting) {
   if (!registered.has(runId)) return;
-  const now = Date.now();
-  for (const [id, at] of completedAt) {
-    if (now - at > COMPLETED_RETENTION_MS) { completed.delete(id); completedAt.delete(id); registered.delete(id); }
-  }
-  completed.set(runId, accounting);
-  completedAt.set(runId, now);
+  completed.set(runId, { accounting, dispatchClosedAt: completed.get(runId)?.dispatchClosedAt ?? null });
+  sweepCompleted(Date.now());
 }
 const PROC_TICKS_PER_SECOND = 100;
 function numberInRange(value: unknown, min: number, max: number) { return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= min && value <= max ? value : null; }
@@ -40,8 +43,13 @@ export function readLocalRunCpuControl(runtimeConfig: unknown): LocalRunCpuContr
   return nice === null && quotaPercent === null ? null : { nice, quotaPercent };
 }
 export function configureLocalRunCpuControl(runId: string, control: LocalRunCpuControl | null) { registered.add(runId); if (control) controls.set(runId, control); else controls.delete(runId); }
-export function clearLocalRunCpuControl(runId: string) { registered.delete(runId); controls.delete(runId); }
-export function takeLocalRunCpuAccounting(runId: string) { completedAt.delete(runId); const accounting = completed.get(runId) ?? null; completed.delete(runId); return accounting; }
+export function clearLocalRunCpuControl(runId: string) {
+  registered.delete(runId);
+  controls.delete(runId);
+  const entry = completed.get(runId);
+  if (entry) entry.dispatchClosedAt = Date.now();
+}
+export function takeLocalRunCpuAccounting(runId: string) { const entry = completed.get(runId) ?? null; completed.delete(runId); return entry?.accounting ?? null; }
 const addNullable = (a: number | null, b: number | null) => a === null && b === null ? null : (a ?? 0) + (b ?? 0);
 const methodRank = { none: 0, nice: 1, cgroup_v2: 2 } as const;
 /**
@@ -118,7 +126,7 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
       const end = processGroupId ? await processGroupCpu(processGroupId) : sampled, userCpuSeconds = Math.max(sampled.user, end.user) / PROC_TICKS_PER_SECOND, systemCpuSeconds = Math.max(sampled.system, end.system) / PROC_TICKS_PER_SECOND;
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
-    const merged = mergeLocalRunCpuAccounting(completed.get(runId) ?? null, result);
+    const merged = mergeLocalRunCpuAccounting(completed.get(runId)?.accounting ?? null, result);
     rememberCompleted(runId, merged); return merged;
   };
 }
