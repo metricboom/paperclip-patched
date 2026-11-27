@@ -7,6 +7,10 @@ export interface LocalRunCpuAccounting {
   quality: "exact_cgroup_v2" | "approximate_proc_group";
   userCpuSeconds: number | null; systemCpuSeconds: number | null; cpuSeconds: number | null; wallSeconds: number;
   control: { requestedQuotaPercent: number | null; requestedNice: number | null; method: "cgroup_v2" | "nice" | "none"; quotaEnforced: boolean; fallbackReason?: string; appliedNice?: number; };
+  // Count of processes that entered the sampled set mid-window with a kernel starttime older than
+  // the window (e.g. reparented into the tree). Their pre-first-observation CPU is unknown and is
+  // excluded from the totals; it is flagged here instead of being reported as measured run CPU.
+  unmeasuredPriorCpuProcesses?: number;
 }
 const controls = new Map<string, LocalRunCpuControl>();
 // Runs dispatched through the heartbeat runtime register here: configureLocalRunCpuControl is
@@ -65,8 +69,10 @@ export function mergeLocalRunCpuAccounting(previous: LocalRunCpuAccounting | nul
   const reasons = [...new Set([previous.control.fallbackReason, next.control.fallbackReason]
     .flatMap(reason => reason ? reason.split("; ") : []))];
   const appliedNice = previous.control.appliedNice ?? next.control.appliedNice;
+  const unmeasuredPriorCpuProcesses = (previous.unmeasuredPriorCpuProcesses ?? 0) + (next.unmeasuredPriorCpuProcesses ?? 0);
   return {
     schema: next.schema, scope: next.scope,
+    ...(unmeasuredPriorCpuProcesses ? { unmeasuredPriorCpuProcesses } : {}),
     quality: previous.quality === "exact_cgroup_v2" && next.quality === "exact_cgroup_v2" ? "exact_cgroup_v2" : "approximate_proc_group",
     userCpuSeconds: addNullable(previous.userCpuSeconds, next.userCpuSeconds),
     systemCpuSeconds: addNullable(previous.systemCpuSeconds, next.systemCpuSeconds),
@@ -100,6 +106,11 @@ async function procStats() {
   }));
   return stats.filter(stat => stat !== null);
 }
+async function bootTimeSeconds() {
+  if (process.platform !== "linux") return null;
+  const btime = Number(/\bbtime (\d+)/.exec(await fs.readFile("/proc/stat", "utf8").catch(() => ""))?.[1]);
+  return Number.isFinite(btime) ? btime : null;
+}
 async function processGroupRows(processGroupId: number) {
   return (await procStats()).filter(sample => sample.pgrp === processGroupId);
 }
@@ -119,11 +130,18 @@ async function processTreeRows(rootPid: number) {
 }
 
 export type HighWaterEntry = { baselineUser: number; baselineSystem: number; maxUser: number; maxSystem: number };
-// Fold one sampling round into the high-water map. Identity is pid + kernel starttime, so a
-// recycled pid starts a fresh entry. baselinedNew is true only for the begin sample: identities
-// observed then may have pre-window CPU (a reused warm process), which is subtracted at finish;
-// identities first observed in later samples were born inside the window and count from zero.
-export function foldProcRowsIntoHighWater(highWater: Map<string, HighWaterEntry>, rows: Array<{ pid: number; user: number; system: number; starttime: number }>, baselinedNew: boolean) {
+const IDENTITY_WINDOW_SLACK_TICKS = 10;
+// Fold one sampling round into the high-water map; returns the number of newly seen identities
+// flagged as pre-window entrants. Identity is pid + kernel starttime, so a recycled pid starts a
+// fresh entry. baselinedNew is true only for the begin sample: identities observed then may have
+// pre-window CPU (a reused warm process), which is subtracted at finish. An identity first seen
+// in a later sample is not proven born inside the window (a pre-existing process can enter the
+// sampled set, e.g. by reparenting), so its kernel starttime is compared with the window start:
+// born at/after the window start -> counts from zero; older, or undecidable -> its first-observed
+// value becomes the baseline so pre-window CPU is not charged to this run, and the entrant is
+// flagged for unmeasuredPriorCpuProcesses because that prior CPU is unknown, not measured.
+export function foldProcRowsIntoHighWater(highWater: Map<string, HighWaterEntry>, rows: Array<{ pid: number; user: number; system: number; starttime: number }>, baselinedNew: boolean, windowStartTicks: number | null) {
+  let preWindowEntrants = 0;
   for (const row of rows) {
     const key = `${row.pid}:${row.starttime}`;
     const prev = highWater.get(key);
@@ -131,14 +149,18 @@ export function foldProcRowsIntoHighWater(highWater: Map<string, HighWaterEntry>
       prev.maxUser = Math.max(prev.maxUser, row.user);
       prev.maxSystem = Math.max(prev.maxSystem, row.system);
     } else {
+      const bornInWindow = windowStartTicks !== null && Number.isFinite(row.starttime) && row.starttime >= windowStartTicks - IDENTITY_WINDOW_SLACK_TICKS;
+      const baselined = baselinedNew || !bornInWindow;
+      if (!baselinedNew && !bornInWindow) preWindowEntrants += 1;
       highWater.set(key, {
-        baselineUser: baselinedNew ? row.user : 0,
-        baselineSystem: baselinedNew ? row.system : 0,
+        baselineUser: baselined ? row.user : 0,
+        baselineSystem: baselined ? row.system : 0,
         maxUser: row.user,
         maxSystem: row.system,
       });
     }
   }
+  return preWindowEntrants;
 }
 export function highWaterDeltaTotals(highWater: Map<string, HighWaterEntry>) {
   let user = 0, system = 0;
@@ -188,17 +210,21 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
   // sample (they then disappear from /proc). Applies to both the process-group match and the
   // process-tree match (no process group on the ACP spawn path; see processTreeRows for the
   // tree membership rule). Identities present in the begin sample keep their observed value as
-  // a baseline that is subtracted at finish, so a reused (warm) process reports only this
-  // window's work and a new run is never charged pre-window CPU; identities first seen later
-  // were born inside the window and count from zero.
+  // a subtracted baseline, so a reused (warm) process reports only this window's work. An
+  // identity entering the sampled set later is disambiguated by its kernel starttime against
+  // the window start (see foldProcRowsIntoHighWater): born in-window counts from zero, a
+  // pre-existing entrant is baselined and flagged in unmeasuredPriorCpuProcesses because its
+  // prior CPU is unknown rather than measured run CPU.
   // Measured sampling limitations (not guaranteed bounds): a process that starts and exits
   // entirely between two samples is never observed; a process reparented out of the tree stops
-  // being matched; a pre-existing process reparented INTO the tree mid-window counts its whole
-  // lifetime.
+  // being matched.
+  const boot = await bootTimeSeconds();
+  const windowStartTicks = boot === null ? null : (Date.now() / 1_000 - boot) * PROC_TICKS_PER_SECOND;
+  let preWindowEntrants = 0;
   const collectRows = processGroupId ? () => processGroupRows(processGroupId) : () => processTreeRows(pid);
   const highWater = new Map<string, HighWaterEntry>();
-  foldProcRowsIntoHighWater(highWater, await collectRows(), true);
-  const sampler = setInterval(() => { void collectRows().then(rows => foldProcRowsIntoHighWater(highWater, rows, false)); }, 250); sampler.unref();
+  foldProcRowsIntoHighWater(highWater, await collectRows(), true, windowStartTicks);
+  const sampler = setInterval(() => { void collectRows().then(rows => { preWindowEntrants += foldProcRowsIntoHighWater(highWater, rows, false, windowStartTicks); }); }, 250); sampler.unref();
   return async () => {
     if (sampler) clearInterval(sampler); const wallSeconds = (Date.now() - startedAt) / 1_000;
     let result: LocalRunCpuAccounting;
@@ -208,9 +234,9 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
       await fs.rmdir(cgroup.directory).catch(() => undefined);
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
-      foldProcRowsIntoHighWater(highWater, await collectRows(), false);
+      preWindowEntrants += foldProcRowsIntoHighWater(highWater, await collectRows(), false, windowStartTicks);
       const end = highWaterDeltaTotals(highWater), userCpuSeconds = end.user / PROC_TICKS_PER_SECOND, systemCpuSeconds = end.system / PROC_TICKS_PER_SECOND;
-      result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
+      result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, ...(preWindowEntrants > 0 ? { unmeasuredPriorCpuProcesses: preWindowEntrants } : {}), control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
     const merged = mergeLocalRunCpuAccounting(completed.get(runId)?.accounting ?? null, result);
     rememberCompleted(runId, merged); return merged;

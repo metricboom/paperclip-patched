@@ -115,10 +115,30 @@ describe("local run CPU controls", () => {
     // process's retained high-water is unaffected.
     const highWater = new Map<string, import("./local-run-cpu.js").HighWaterEntry>();
     const row = (pid: number, starttime: number, user: number, system: number) => ({ pid, starttime, user, system });
-    foldProcRowsIntoHighWater(highWater, [row(7, 100, 50, 5)], true);  // present at begin: baseline
-    foldProcRowsIntoHighWater(highWater, [row(7, 100, 80, 9)], false); // in-window work: +30/+4
-    foldProcRowsIntoHighWater(highWater, [row(7, 200, 30, 2)], false); // recycled pid: new identity
+    foldProcRowsIntoHighWater(highWater, [row(7, 100, 50, 5)], true, 100);  // present at begin: baseline
+    foldProcRowsIntoHighWater(highWater, [row(7, 100, 80, 9)], false, 100); // in-window work: +30/+4
+    // Recycled pid: starttime 200 is at/after the window start, so it is a born-in-window
+    // identity and its observed work counts from zero.
+    expect(foldProcRowsIntoHighWater(highWater, [row(7, 200, 30, 2)], false, 100)).toBe(0);
     expect(highWaterDeltaTotals(highWater)).toEqual({ user: 60, system: 6 });
+  });
+
+  it("flags a pre-existing process entering the sampled set instead of charging its lifetime", () => {
+    // First seen after begin does not prove born in-window. An identity whose kernel starttime
+    // predates the window start (e.g. reparented into the tree) is baselined at first
+    // observation: only its post-observation delta counts, the entrant is flagged, and its
+    // earlier lifetime is never reported as measured run CPU.
+    const highWater = new Map<string, import("./local-run-cpu.js").HighWaterEntry>();
+    const row = (pid: number, starttime: number, user: number, system: number) => ({ pid, starttime, user, system });
+    foldProcRowsIntoHighWater(highWater, [row(7, 5000, 10, 1)], true, 5000); // begin at tick 5000
+    expect(foldProcRowsIntoHighWater(highWater, [row(9, 1000, 400, 40)], false, 5000)).toBe(1); // pre-existing entrant
+    expect(foldProcRowsIntoHighWater(highWater, [row(9, 1000, 430, 44)], false, 5000)).toBe(0); // +30/+4 in-window
+    expect(foldProcRowsIntoHighWater(highWater, [row(10, 5001, 20, 2)], false, 5000)).toBe(0);  // born in-window
+    expect(highWaterDeltaTotals(highWater)).toEqual({ user: 50, system: 6 });
+    // Undecidable origin (no window reference) is also baselined and flagged, never assumed new.
+    const blind = new Map<string, import("./local-run-cpu.js").HighWaterEntry>();
+    expect(foldProcRowsIntoHighWater(blind, [row(11, 42, 90, 9)], false, null)).toBe(1);
+    expect(highWaterDeltaTotals(blind)).toEqual({ user: 0, system: 0 });
   });
 
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {
