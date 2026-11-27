@@ -9,6 +9,9 @@ import { isExecutionForcedToKubernetes } from "../execution-allowlist.js";
 import { parseIssueExecutionWorkspaceSettings } from "../execution-workspace-policy.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 
+import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
+import { savedAdmittedLeaseId } from "./admitted-lease.js";
+
 export class AgentRunSlotsFull extends Error {
   constructor(readonly agentId: string, readonly running: number, readonly limit: number) {
     super("The agent already runs as many runs at once as it allows.");
@@ -45,8 +48,11 @@ export function configuredHostRunId() { return process.env.PAPERCLIP_HOST_ID?.tr
  * default, the instance default, and finally the local default. Kubernetes forcing and the
  * managed-sandbox-only policy move a local result off the host, so both count as not local.
  * Anything that cannot be resolved counts as local and is logged, so nothing escapes the cap.
- * Known gap: provider-API placement (controller-only external providers) is not resolved
- * here; those runs are counted as local.
+ * Provider-API placement (controller-only external providers) resolves no environment in the
+ * executor, so those runs are not local. A saved lease decides the target only when the executor
+ * would actually reuse it (savedAdmittedLeaseId, shared with environment-selection.ts) and the
+ * lease is bound to this run, issue, agent, and saved environment; otherwise the current target
+ * is resolved.
  */
 export async function resolveHostRunLocality(tx: Pick<Db, "select">, run: ClaimingRun): Promise<boolean> {
   const unresolved = (reason: string, extra?: Record<string, unknown>) => {
@@ -56,7 +62,8 @@ export async function resolveHostRunLocality(tx: Pick<Db, "select">, run: Claimi
   };
   try {
     const context = parseObject(run.contextSnapshot);
-    const [agent] = await tx.select({ companyId: agents.companyId, permissions: agents.permissions, defaultEnvironmentId: agents.defaultEnvironmentId })
+    const [agent] = await tx.select({ companyId: agents.companyId, permissions: agents.permissions, defaultEnvironmentId: agents.defaultEnvironmentId,
+      adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
       .from(agents).where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId))).limit(1);
     if (!agent) return unresolved("agent_not_found");
     const [settings] = await tx.select({ defaultEnvironmentId: instanceSettings.defaultEnvironmentId, general: instanceSettings.general, experimental: instanceSettings.experimental })
@@ -64,17 +71,29 @@ export async function resolveHostRunLocality(tx: Pick<Db, "select">, run: Claimi
     const executionMode = parseObject(settings?.general).executionMode;
     if (isExecutionForcedToKubernetes({ executionMode: executionMode === "kubernetes" ? "kubernetes" : "any" })) return false;
 
+    // Controller-side placements resolve no environment in the executor, so they are never local.
+    // A malformed persisted input cannot be reused by the executor either; fall through to the
+    // current target instead of trusting the saved lease.
+    let leaseId: string | null = null;
+    try {
+      if (resolveProviderApiPlacement({ run, agent }) !== null) return false;
+      leaseId = savedAdmittedLeaseId({ run, agent });
+    } catch {
+      leaseId = null;
+    }
+
     let environmentId: string | null = null;
-    const leaseId = parseObject(context.paperclipEnvironment).leaseId;
-    if (typeof leaseId === "string" && isUuidLike(leaseId)) {
+    if (leaseId !== null && isUuidLike(leaseId)) {
       const [lease] = await tx.select({ environmentId: environmentLeases.environmentId, heartbeatRunId: environmentLeases.heartbeatRunId,
         issueId: environmentLeases.issueId, metadata: environmentLeases.metadata }).from(environmentLeases)
         .where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, run.companyId))).limit(1);
       // Same binding the executor checks (environment-selection.ts): a retry that merely inherits a
       // predecessor's lease id must not decide where this run executes.
       const contextIssueId = typeof context.issueId === "string" ? context.issueId : null;
-      const bound = lease && lease.heartbeatRunId === run.id && (lease.issueId ?? null) === contextIssueId
-        && parseObject(lease.metadata).agentId === run.agentId;
+      const savedEnvironmentId = parseObject(context.paperclipEnvironment).id;
+      const bound = lease && lease.environmentId && lease.heartbeatRunId === run.id && (lease.issueId ?? null) === contextIssueId
+        && parseObject(lease.metadata).agentId === run.agentId
+        && (typeof savedEnvironmentId !== "string" || savedEnvironmentId === lease.environmentId);
       environmentId = bound ? lease.environmentId ?? null : null;
     }
     if (!environmentId) {
@@ -117,7 +136,7 @@ export async function hostRunProfileFor(tx: Pick<Db, "select">, run: ClaimingRun
   return limit === null ? {} : { hostRun: { hostId: configuredHostRunId(), limit, local: await resolveHostRunLocality(tx, run) } };
 }
 
-type ClaimingRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "retryOfRunId" | "contextSnapshot">;
+type ClaimingRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "retryOfRunId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson" | "driverKind">;
 
 export async function assertAgentRunSlotFree(tx: Pick<Db, "select" | "execute">, run: ClaimingRun) {
   const hostLimit = hostRunLimit();

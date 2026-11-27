@@ -4,6 +4,28 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const warn = vi.hoisted(() => vi.fn());
 vi.mock("../../middleware/logger.js", () => ({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
+// The predicate under test decides from the parsed shape; parse validation itself is covered by
+// the runner contract tests. A sentinel stands in for input the real parser would reject.
+vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    parseNativeExecutionInput: (value: unknown) => {
+      if (value && typeof value === "object" && (value as { __invalidNativeInput?: boolean }).__invalidNativeInput) {
+        throw new Error("invalid native execution input");
+      }
+      return value;
+    },
+  };
+});
+
+vi.mock("../native-runtime/native-workspace-sync.js", () => ({
+  readNativeWorkspaceSyncReference: (value: unknown) => {
+    const candidate = value && typeof value === "object" ? (value as { leaseId?: unknown }) : null;
+    return candidate && typeof candidate.leaseId === "string" ? { leaseId: candidate.leaseId } : null;
+  },
+}));
+
 import { assertAgentRunSlotFree, HostRunOrderingRefused, HostRunSlotsFull, hostRunProfileFor, resolveHostRunLocality } from "./run-slot-admission.js";
 
 /** Each select() resolves with the next queued rows, whatever builder methods are chained on it. */
@@ -62,7 +84,11 @@ describe("claim-time host locality", () => {
     expect(selects()).toBe(2);
   });
 
-  const leased = () => ({ ...(run as object), contextSnapshot: { paperclipEnvironment: { leaseId: randomUUID() } } } as never);
+  // The executor reuses a saved lease only for a persisted native execution input, so these
+  // runs are native with a parseable codex input; a legacy run never follows its saved lease.
+  const nativeProfile = { nativeExecutionInput: { provider: { kind: "codex" } } };
+  const leased = () => ({ ...(run as object), runtimeMode: "native", runnerProfileJson: nativeProfile,
+    contextSnapshot: { paperclipEnvironment: { leaseId: randomUUID() } } } as never);
   const leaseRow = (over: Record<string, unknown> = {}) => [{ environmentId: "e9", heartbeatRunId: "run-2", issueId: null, metadata: { agentId: "a" }, ...over }];
 
   it("prefers the environment of a lease bound to this run over the agent default", async () => {
@@ -92,6 +118,66 @@ describe("claim-time host locality", () => {
     const tx = { select: () => { throw new Error("db down"); } } as never;
     expect(await resolveHostRunLocality(tx, run)).toBe(true);
     expect(warn).toHaveBeenCalledWith(expect.objectContaining({ reason: "resolution_failed" }), expect.any(String));
+  });
+
+  describe("executor-equivalent saved lease", () => {
+    const runnerAgent = (defaultEnvironmentId: string | null, over: Record<string, unknown> = {}) =>
+      [{ companyId: "c", permissions: {}, defaultEnvironmentId, adapterType: "paperclip_runner", adapterConfig: { provider: "codex" }, ...over }];
+    const nativeRun = (profile: Record<string, unknown>, contextSnapshot: Record<string, unknown>) =>
+      ({ id: "run-2", companyId: "c", agentId: "a", retryOfRunId: null, contextSnapshot,
+        runtimeMode: "native", runnerProfileJson: profile, driverKind: null }) as never;
+    const codexProfile = { nativeExecutionInput: { provider: { kind: "codex" } } };
+
+    it("honors a bound lease for a persisted native run, matching the executor", async () => {
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), leaseRow(), [{ driver: "sandbox" }]]);
+      expect(await resolveHostRunLocality(tx, nativeRun(codexProfile,
+        { paperclipEnvironment: { leaseId: randomUUID() } }))).toBe(false);
+    });
+
+    it("honors a bound lease that is local", async () => {
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), leaseRow(), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, nativeRun(codexProfile,
+        { paperclipEnvironment: { leaseId: randomUUID() } }))).toBe(true);
+    });
+
+    it("ignores the saved lease for a legacy run and resolves the current target", async () => {
+      const legacyRun = { id: "run-2", companyId: "c", agentId: "a", retryOfRunId: null,
+        contextSnapshot: { paperclipEnvironment: { leaseId: randomUUID() } }, runtimeMode: "legacy",
+        runnerProfileJson: null, driverKind: null } as never;
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, legacyRun)).toBe(true);
+    });
+
+    it("ignores the saved lease when the persisted native input cannot be parsed", async () => {
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, nativeRun({ nativeExecutionInput: { __invalidNativeInput: true } },
+        { paperclipEnvironment: { leaseId: randomUUID() } }))).toBe(true);
+    });
+
+    it("ignores the saved lease for a controller-only external provider run", async () => {
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, nativeRun({ nativeExecutionInput: { provider: { kind: "openai_dot" } } },
+        { paperclipEnvironment: { leaseId: randomUUID() } }))).toBe(true);
+    });
+
+    it("classes provider-API placement as not local, since the executor runs it controller-side", async () => {
+      const { tx, selects } = fakeTx([runnerAgent("e1"), settings()]);
+      expect(await resolveHostRunLocality(tx, nativeRun({ nativeExecutionInput: { provider: { kind: "cursor_cloud" } } },
+        { paperclipEnvironment: { leaseId: randomUUID() } }))).toBe(false);
+      expect(selects()).toBe(2);
+    });
+
+    it("follows the native workspace sync lease fallback like the executor", async () => {
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), leaseRow(), [{ driver: "sandbox" }]]);
+      expect(await resolveHostRunLocality(tx, nativeRun(
+        { ...codexProfile, nativeWorkspaceSync: { leaseId: randomUUID() } }, {}))).toBe(false);
+    });
+
+    it("ignores a lease whose environment does not match the saved environment id", async () => {
+      const { tx } = fakeTx([runnerAgent("e1"), settings(), leaseRow(), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, nativeRun(codexProfile,
+        { paperclipEnvironment: { leaseId: randomUUID(), id: "other-env" } }))).toBe(true);
+    });
   });
 
   it("records the classification on the run profile only when the cap is on", async () => {
