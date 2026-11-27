@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, containProcessGroupInCgroup, foldProcRowsIntoHighWater, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, containProcessGroupInCgroup, foldProcRowsIntoHighWater, isBenignProcWriteError, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -171,6 +171,27 @@ describe("local run CPU controls", () => {
       try { process.kill(-child.pid!, "SIGKILL"); } catch { /* gone */ }
       child.kill("SIGKILL");
       const fs = await import("node:fs/promises");
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails containment on non-ESRCH cgroup.procs write errors instead of assuming an exited pid", async () => {
+    if (process.platform !== "linux") return;
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    // Only ESRCH (the pid exited between scan and write) is benign; anything else - here a
+    // permission-style failure simulated by a cgroup.procs that is a directory - must propagate
+    // so the run falls back with a real reason instead of claiming containment.
+    expect(isBenignProcWriteError(Object.assign(new Error("gone"), { code: "ESRCH" }))).toBe(true);
+    expect(isBenignProcWriteError(Object.assign(new Error("denied"), { code: "EACCES" }))).toBe(false);
+    expect(isBenignProcWriteError(new Error("plain"))).toBe(false);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cpu-cgroup-eperm-"));
+    try {
+      const directory = path.join(root, "paperclip-runs", "cpu-eperm");
+      await fs.mkdir(path.join(directory, "cgroup.procs"), { recursive: true });
+      await expect(containProcessGroupInCgroup(directory, process.pid, null)).rejects.toThrow();
+    } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });

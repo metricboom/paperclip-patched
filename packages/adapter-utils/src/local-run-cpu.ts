@@ -199,15 +199,35 @@ async function collectProcessGroupPids(pgid: number) { return (await procStats()
 // Attach-before-fork containment. The command starts before this helper runs, so a child that
 // forks during startup would escape a move of only the root pid: that descendant stays in the
 // original cgroup, outside the quota and the cpu.stat accounting. The spawned group is detached
-// and private to this run, so stop the whole group first (no member can fork while stopped; a
-// fork that already completed appears in /proc and is swept), move every member into the
-// cgroup, then resume. This preserves the spawn contract exactly: no launcher, no shell, no
-// change to command-not-found or detached/group behavior. cpu.stat covers CPU consumed after
+// and private to this run, so stop the whole group first (no group member can fork while
+// stopped; a fork that already completed appears in /proc and is swept), move every group member
+// and every descendant still in the ppid tree into the cgroup, then resume. The pause lasts as
+// long as the /proc scans and writes take - bounded by the 8-pass cap on passes, not by any
+// guaranteed millisecond budget. The freshly spawned root can also exit before or during this
+// work: its numeric pid is only ever written to cgroup.procs (an ESRCH there is benign) and the
+// group stop/resume tolerate the group being gone. This preserves the
+// spawn contract exactly: no launcher, no shell, no change to command-not-found or
+// detached/group behavior. Residual limits (disclosed, not claimed closed): a descendant that
+// left the process group before the stop keeps running during the sweep and can fork further,
+// and a fully daemonized descendant (reparented to init) escapes the tree; closing those needs
+// a gated launcher, which changes spawn-error semantics. cpu.stat covers CPU consumed after
 // containment; the milliseconds between spawn and containment are outside the cgroup (measured
 // limitation). Appends let a test on a plain filesystem observe every moved pid.
+// Only ESRCH proves the pid exited between the scan and the write (benign: a dead process holds
+// no CPU and inherits nothing). Permission, controller or busy errors are containment failures.
+export function isBenignProcWriteError(error: unknown) {
+  return (error as NodeJS.ErrnoException | null)?.code === "ESRCH";
+}
 export async function containProcessGroupInCgroup(directory: string, pid: number, pgid: number | null) {
+  const writeProc = async (member: number) => {
+    try {
+      await fs.writeFile(`${directory}/cgroup.procs`, `${member}\n`, { flag: "a" });
+    } catch (error) {
+      if (!isBenignProcWriteError(error)) throw error;
+    }
+  };
   if (pgid === null || pgid <= 0) {
-    await fs.writeFile(`${directory}/cgroup.procs`, `${pid}\n`, { flag: "a" });
+    await writeProc(pid);
     return;
   }
   const stopped = stopProcessGroup(pgid);
@@ -218,16 +238,37 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
       for (const member of await collectProcessGroupPids(pgid)) {
         if (moved.has(member)) continue;
         moved.add(member); added = true;
-        // A member can still exit between the scan and its write; that is not containment failure.
-        await fs.writeFile(`${directory}/cgroup.procs`, `${member}\n`, { flag: "a" }).catch(() => undefined);
+        await writeProc(member);
       }
       if (!added) break;
     }
+    // Descendants that already left the process group (setsid/setpgid before the stop) are not
+    // covered by the group scan, so sweep the ppid-ancestry tree too. Residual limitation: the
+    // stop cannot freeze a group-escaped descendant, which can keep forking during the sweep,
+    // and full daemonization (reparented to init) escapes the tree entirely.
+    for (const row of await processTreeRows(pid)) {
+      if (moved.has(row.pid)) continue;
+      moved.add(row.pid);
+      await writeProc(row.pid);
+    }
     // The root itself is in the group it leads; this covers the rare case where the group stop
     // failed because the root already exited but other members remain.
-    if (!moved.has(pid)) await fs.writeFile(`${directory}/cgroup.procs`, `${pid}\n`, { flag: "a" }).catch(() => undefined);
+    if (!moved.has(pid)) await writeProc(pid);
   } finally {
     if (stopped) resumeProcessGroup(pgid);
+  }
+}
+// A populated kernel cgroup cannot be removed (EBUSY): move its member processes out first. The
+// immediate parent enables the cpu controller for its children, so it cannot host processes
+// itself; the move-back target is the delegated subtree root's cgroup.procs. Best effort: the
+// whole cleanup path tolerates failure because a leftover empty cgroup directory is retried on
+// the next finish and carries no running processes after the run's tree has exited.
+async function releaseCgroupProcesses(directory: string) {
+  const procs = await fs.readFile(`${directory}/cgroup.procs`, "utf8").catch(() => "");
+  const root = process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup";
+  for (const line of procs.split("\n")) {
+    const member = line.trim();
+    if (member) await fs.writeFile(`${root}/cgroup.procs`, `${member}\n`, { flag: "a" }).catch(() => undefined);
   }
 }
 async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, quotaPercent: number) {
@@ -240,6 +281,7 @@ async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, 
     const start = cpuStat(await fs.readFile(`${directory}/cpu.stat`, "utf8")); if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
     return { directory, start };
   } catch (error) {
+    await releaseCgroupProcesses(directory);
     await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
@@ -280,6 +322,7 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
     if (cgroup) {
       const end = cpuStat(await fs.readFile(`${cgroup.directory}/cpu.stat`, "utf8").catch(() => ""));
       const user = end && end.user !== null && cgroup.start.user !== null ? (end.user - cgroup.start.user) / 1_000_000 : null, system = end && end.system !== null && cgroup.start.system !== null ? (end.system - cgroup.start.system) / 1_000_000 : null, cpu = end ? (end.usage - cgroup.start.usage) / 1_000_000 : null;
+      await releaseCgroupProcesses(cgroup.directory);
       await fs.rm(cgroup.directory, { recursive: true, force: true }).catch(() => undefined);
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
