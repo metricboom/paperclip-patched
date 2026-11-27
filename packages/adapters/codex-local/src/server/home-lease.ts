@@ -30,17 +30,25 @@ import path from "node:path";
 export const RUN_LEASE_FILE = ".paperclip-run-lease";
 export const RUN_LEASES_DIR = ".paperclip-run-leases";
 const HOUR_MS = 60 * 60 * 1000;
-/** A lease older than this is treated as abandoned even if its pid is alive. */
+/**
+ * Kept for reference only. A lease is never treated as abandoned because of its age: a live pid
+ * always wins, and a lease whose pid cannot be checked is kept (fail closed).
+ */
 export const MAX_LEASE_AGE_MS = 24 * HOUR_MS;
 const CLAIM_WAIT_MS = 30_000;
 const CLAIM_POLL_MS = 20;
 
+/**
+ * False only when the pid is confirmed gone (ESRCH). Any other error - EPERM, a pid Node
+ * refuses to check (ERR_INVALID_ARG_TYPE for 2**31 and above), or anything unexpected -
+ * means the pid could not be checked, so it counts as alive (fail closed).
+ */
 export function pidIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
   }
 }
 
@@ -50,23 +58,52 @@ export function claimPathFor(home: string): string {
   return path.join(path.dirname(home), `.claim-${path.basename(home)}`);
 }
 
-function leaseIsLive(raw: string, now: number): boolean {
+/**
+ * A lease is dead only when its owner pid is known and no longer running. A live pid wins
+ * whatever the lease's age, and a lease whose pid cannot be checked (missing, malformed or
+ * corrupt) is kept: cleanup fails closed.
+ */
+function leaseIsLive(raw: string): boolean {
   try {
-    const lease = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown };
-    if (typeof lease.pid !== "number" || typeof lease.startedAt !== "number") return true; // unreadable: be safe
-    return pidIsAlive(lease.pid) && now - lease.startedAt < MAX_LEASE_AGE_MS;
+    const lease = JSON.parse(raw) as { pid?: unknown };
+    if (typeof lease.pid !== "number" || !Number.isInteger(lease.pid) || lease.pid <= 0) return true; // cannot check: be safe
+    return pidIsAlive(lease.pid);
   } catch {
     return true; // corrupt lease: be safe
   }
 }
 
-export async function homeHasLiveLease(home: string, now: number): Promise<boolean> {
-  const legacy = await fs.readFile(path.join(home, RUN_LEASE_FILE), "utf8").catch(() => null);
-  if (legacy !== null && leaseIsLive(legacy, now)) return true;
+const isNotFound = (error: unknown) => (error as NodeJS.ErrnoException)?.code === "ENOENT";
+
+/** Read a lease file. Null means it is gone; any other read error counts as a live lease. */
+async function readLeaseIsLive(file: string): Promise<boolean | null> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    return true; // permission, EISDIR, I/O error...: leased / unknown, do not touch
+  }
+  return leaseIsLive(raw);
+}
+
+/**
+ * True when the home is or may be in use. Only "not found" means "no lease"; every other read
+ * or directory error is treated as a live lease (fail closed). `now` is kept for callers; age
+ * no longer decides anything.
+ */
+export async function homeHasLiveLease(home: string, _now?: number): Promise<boolean> {
+  if ((await readLeaseIsLive(path.join(home, RUN_LEASE_FILE))) === true) return true;
   const leaseDir = path.join(home, RUN_LEASES_DIR);
-  for (const name of await fs.readdir(leaseDir).catch(() => [] as string[])) {
-    const raw = await fs.readFile(path.join(leaseDir, name), "utf8").catch(() => null);
-    if (raw !== null && leaseIsLive(raw, now)) return true;
+  let names: string[];
+  try {
+    names = await fs.readdir(leaseDir);
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    return true;
+  }
+  for (const name of names) {
+    if ((await readLeaseIsLive(path.join(leaseDir, name))) === true) return true;
   }
   return false;
 }
@@ -111,7 +148,10 @@ export async function acquireRunLease(home: string, now = Date.now()): Promise<(
         console.warn(`[home-lease] cleanup claim ${claimPath} has a dead owner; leaving it in place and waiting`);
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      // A cleanup that renames the home away mid-mkdir surfaces as ENOENT or, from a recursive
+      // mkdir racing the rename, ENOTDIR. Both mean "the home moved": step back and retry.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
         await release();
         throw error;
       }
@@ -152,6 +192,21 @@ export async function claimHome(home: string): Promise<HomeClaim | null> {
 export const TOMB_PREFIX = ".removing-";
 
 /**
+ * True when `target` is a real (non-symlink) entry whose resolved path is inside `root`'s
+ * resolved path. Any lookup error counts as outside: the caller then leaves the entry alone.
+ */
+export async function isRealEntryInside(target: string, root: string): Promise<boolean> {
+  try {
+    if ((await fs.lstat(target)).isSymbolicLink()) return false;
+    const [realTarget, realRoot] = await Promise.all([fs.realpath(target), fs.realpath(root)]);
+    const rel = path.relative(realRoot, realTarget);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Detach `home` (or the given paths inside it) from its path while holding the home's claim.
  * With the claim held no run can take a lease and be handed this home, so the lease and
  * idle checks are final. Nothing is ever moved back: what is detached has already passed
@@ -164,6 +219,8 @@ export async function detachHomeIfUnused(input: {
   now: number;
   isIdle: () => Promise<boolean>;
   afterClaim?: (home: string) => Promise<void>;
+  /** When set, each target must resolve inside this root right before it is moved. */
+  managedRoot?: string;
 }): Promise<string[] | null> {
   const claim = await claimHome(input.home);
   if (!claim) return null; // another cleaner holds it
@@ -173,6 +230,10 @@ export async function detachHomeIfUnused(input: {
     if (await homeHasLiveLease(input.home, input.now)) return null;
     if (!(await input.isIdle())) return null;
     for (const target of input.targets) {
+      // Never move a symlink, and never move anything that no longer resolves inside the root.
+      const stat = await fs.lstat(target).catch(() => null);
+      if (!stat || stat.isSymbolicLink()) continue;
+      if (input.managedRoot && !(await isRealEntryInside(target, input.managedRoot))) continue;
       const tomb = path.join(input.agentDir, `${TOMB_PREFIX}${randomUUID()}`);
       if (await fs.rename(target, tomb).then(() => true, () => false)) tombs.push(tomb);
     }

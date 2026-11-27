@@ -1815,9 +1815,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // If the process dies before reaching this, the next
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
-    await observabilityProfile?.cleanup();
-    await preparedRuntimeConfig.cleanup();
-    await releaseHomeLease?.();
+    try {
+      await observabilityProfile?.cleanup();
+      await preparedRuntimeConfig.cleanup();
+    } finally {
+      // Release the run's home lease even when a cleanup above rejects; the original error
+      // still propagates. A lease left behind would keep this home from ever being cleaned.
+      await releaseHomeLease?.();
+    }
     if (generatedHome) {
       await cleanupGeneratedCodexHomes({
         env: process.env, companyId: agent.companyId, agentId: agent.id, currentHome: generatedHome,

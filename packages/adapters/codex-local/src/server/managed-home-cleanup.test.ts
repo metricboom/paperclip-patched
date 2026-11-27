@@ -203,6 +203,128 @@ describe("cleanupGeneratedCodexHomes", () => {
     await run();
     expect(await exists(path.join(other, "plugins"))).toBe(true);
   });
+
+  describe("review findings (PR #5 follow-up)", () => {
+    /** Write a raw lease entry, then age the home again so it stays a removal candidate. */
+    async function writeLeaseEntry(home: string, write: (leaseDir: string) => Promise<void>) {
+      const leaseDir = path.join(home, ".paperclip-run-leases");
+      await write(leaseDir);
+      const idle = new Date(now - 30 * DAY);
+      await fs.utimes(leaseDir, idle, idle).catch(() => {});
+      await fs.utimes(home, idle, idle);
+    }
+
+    it("live pid wins over age: an old lease whose pid is alive keeps the home and its runtime files", async () => {
+      await makeHome("b".repeat(64), HOUR); // newer
+      const leased = await makeHome("c".repeat(64), 30 * DAY);
+      await writeLeaseEntry(leased, async (leaseDir) => {
+        await fs.mkdir(leaseDir, { recursive: true });
+        // Started two days ago (past the 24-hour mark), owned by this live test process.
+        await fs.writeFile(path.join(leaseDir, "old.json"), JSON.stringify({ pid: process.pid, startedAt: now - 2 * DAY }));
+      });
+      const result = await run();
+      expect(result.removedHomes).toEqual([]);
+      expect(result.prunedRuntime).toEqual([]);
+      expect(await exists(path.join(leased, "plugins/cache/f"))).toBe(true);
+      expect(await exists(path.join(leased, "cache/f"))).toBe(true);
+      expect(await exists(path.join(leased, "sessions/f"))).toBe(true);
+    });
+
+    it("live pid wins over age for the legacy single lease file too", async () => {
+      await makeHome("b".repeat(64), HOUR);
+      const leased = await makeHome("c".repeat(64), 30 * DAY);
+      await fs.writeFile(path.join(leased, ".paperclip-run-lease"), JSON.stringify({ pid: process.pid, startedAt: now - 2 * DAY }));
+      const idle = new Date(now - 30 * DAY);
+      await fs.utimes(path.join(leased, ".paperclip-run-lease"), idle, idle);
+      await fs.utimes(leased, idle, idle);
+      expect((await run()).removedHomes).toEqual([]);
+      expect(await exists(path.join(leased, "plugins/cache/f"))).toBe(true);
+    });
+
+    it("fails closed on a lease file that cannot be read (EISDIR)", async () => {
+      await makeHome("b".repeat(64), HOUR);
+      const leased = await makeHome("c".repeat(64), 30 * DAY);
+      await writeLeaseEntry(leased, async (leaseDir) => {
+        await fs.mkdir(path.join(leaseDir, "unreadable.json"), { recursive: true }); // readFile -> EISDIR
+      });
+      expect((await run()).removedHomes).toEqual([]);
+      expect(await exists(path.join(leased, "sessions/f"))).toBe(true);
+      expect(await exists(path.join(leased, "plugins/cache/f"))).toBe(true);
+    });
+
+    it("fails closed when the lease directory cannot be listed (ENOTDIR)", async () => {
+      await makeHome("b".repeat(64), HOUR);
+      const leased = await makeHome("c".repeat(64), 30 * DAY);
+      await writeLeaseEntry(leased, async (leaseDir) => { await fs.writeFile(leaseDir, "not a dir"); });
+      expect((await run()).removedHomes).toEqual([]);
+      expect(await exists(path.join(leased, "sessions/f"))).toBe(true);
+    });
+
+    it("never follows a symlinked agent dir out of the managed root", async () => {
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "codex-outside-agent-"));
+      try {
+        await makeHome("b".repeat(64), HOUR, outside);
+        const victim = await makeHome("c".repeat(64), 30 * DAY, outside);
+        const pruneVictim = await makeHome("d".repeat(64), 4 * HOUR, outside);
+        await fs.mkdir(path.dirname(agentDir), { recursive: true });
+        await fs.symlink(outside, agentDir);
+        const result = await run();
+        expect(result.removedHomes).toEqual([]);
+        expect(result.prunedRuntime).toEqual([]);
+        expect(await exists(path.join(victim, "sessions/f"))).toBe(true);
+        expect(await exists(path.join(pruneVictim, "plugins/cache/f"))).toBe(true);
+        expect((await fs.readdir(outside)).filter((n) => n.startsWith(".removing-") || n.startsWith(".claim-"))).toEqual([]);
+        expect((await fs.lstat(agentDir)).isSymbolicLink()).toBe(true);
+      } finally {
+        await fs.rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it("never follows a symlinked skill-runtimes dir out of the managed root", async () => {
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "codex-outside-tree-"));
+      try {
+        const outsideAgent = path.join(outside, AGENT);
+        await makeHome("b".repeat(64), HOUR, outsideAgent);
+        const victim = await makeHome("c".repeat(64), 30 * DAY, outsideAgent);
+        const treeDir = path.dirname(agentDir);
+        await fs.mkdir(path.dirname(treeDir), { recursive: true });
+        await fs.symlink(outside, treeDir);
+        const result = await run();
+        expect(result.removedHomes).toEqual([]);
+        expect(await exists(path.join(victim, "sessions/f"))).toBe(true);
+        expect(await exists(path.join(victim, "plugins/cache/f"))).toBe(true);
+        expect((await fs.lstat(treeDir)).isSymbolicLink()).toBe(true);
+      } finally {
+        await fs.rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it("never selects, renames or deletes a symlinked plugins dir or a symlinked leftover", async () => {
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "codex-outside-entry-"));
+      try {
+        await fs.writeFile(path.join(outside, "keep"), "x");
+        await makeHome("b".repeat(64), 0);
+        const stale = await makeHome("c".repeat(64), 4 * HOUR);
+        const pluginsLink = path.join(stale, "plugins");
+        await fs.rm(pluginsLink, { recursive: true, force: true });
+        await fs.symlink(outside, pluginsLink);
+        const tombLink = path.join(agentDir, ".removing-link");
+        await fs.symlink(outside, tombLink);
+        const old = new Date(now - 4 * HOUR);
+        await fs.lutimes(pluginsLink, old, old);
+        await fs.lutimes(tombLink, old, old);
+        await fs.utimes(stale, old, old);
+        const result = await run();
+        expect(result.prunedRuntime).toEqual([path.join(stale, "cache")]); // the real dir only
+        expect(await exists(path.join(stale, "cache"))).toBe(false);
+        expect((await fs.lstat(pluginsLink)).isSymbolicLink()).toBe(true);
+        expect((await fs.lstat(tombLink)).isSymbolicLink()).toBe(true);
+        expect(await exists(path.join(outside, "keep"))).toBe(true);
+      } finally {
+        await fs.rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 describe("digestCodexConfigForHomeIdentity", () => {

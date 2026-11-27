@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveManagedCodexHomeDir } from "./codex-home.js";
-import { detachHomeIfUnused, homeHasLiveLease, TOMB_PREFIX } from "./home-lease.js";
+import { detachHomeIfUnused, homeHasLiveLease, isRealEntryInside, TOMB_PREFIX } from "./home-lease.js";
 
 export { acquireRunLease, RUN_LEASE_FILE, RUN_LEASES_DIR } from "./home-lease.js";
 
@@ -23,7 +23,9 @@ export { acquireRunLease, RUN_LEASE_FILE, RUN_LEASES_DIR } from "./home-lease.js
  *    and the adapter already falls back to a fresh session when resume fails.
  *
  * Never touched: a home with a live lease, an agent's newest home (per tree),
- * the home the current run uses, and anything outside the managed tree.
+ * the home the current run uses, and anything outside the managed tree. Symlinks are
+ * never followed: a symlinked tree or agent dir is skipped, and a symlink entry is never
+ * selected, renamed or deleted.
  */
 
 export const GENERATED_HOME_TREES = ["skill-runtimes", "connector-runtimes"] as const;
@@ -38,6 +40,12 @@ export type GeneratedHomeCleanupResult = {
   removedHomes: string[];
   bytesFreedEstimate: number;
 };
+
+/** A real directory, not a symlink. Errors count as "no". */
+async function isRealDir(target: string): Promise<boolean> {
+  const stat = await fs.lstat(target).catch(() => null);
+  return !!stat && stat.isDirectory() && !stat.isSymbolicLink();
+}
 
 /** Latest mtime among the home and its top-level entries (sqlite/session writes bump these). */
 async function lastActivityMs(home: string): Promise<number> {
@@ -59,9 +67,10 @@ async function treeSize(target: string): Promise<number> {
 }
 
 /** Delete detached copies and report the bytes freed. Safe at any time: they are off every path. */
-async function removeTombs(tombs: string[]): Promise<number> {
+async function removeTombs(tombs: string[], managedRoot: string): Promise<number> {
   let bytes = 0;
   for (const tomb of tombs) {
+    if (!(await isRealEntryInside(tomb, managedRoot))) continue;
     bytes += await treeSize(tomb);
     await fs.rm(tomb, { recursive: true, force: true });
   }
@@ -89,15 +98,25 @@ export async function cleanupGeneratedCodexHomes(input: {
   const managedRoot = resolveManagedCodexHomeDir(input.env, input.companyId);
   const current = input.currentHome ? path.resolve(input.currentHome) : null;
 
+  const realRoot = await fs.realpath(managedRoot).catch(() => null);
+  if (!realRoot) return result;
+
   for (const tree of GENERATED_HOME_TREES) {
-    const agentDir = path.join(managedRoot, tree, input.agentId);
+    // Never descend through a symlink: the tree dir and the agent dir must be real directories
+    // whose resolved path is exactly where they should be under the managed root.
+    const treeDir = path.join(managedRoot, tree);
+    const agentDir = path.join(treeDir, input.agentId);
+    if (!(await isRealDir(treeDir)) || !(await isRealDir(agentDir))) continue;
+    if ((await fs.realpath(agentDir).catch(() => null)) !== path.join(realRoot, tree, input.agentId)) continue;
     const names = await fs.readdir(agentDir).catch(() => [] as string[]);
     // Detached copies are off every path and already passed the lease and activity checks, so
     // leftovers from a cleaner that died before its delete can go. This never touches a live home.
     for (const name of names) {
       if (!name.startsWith(TOMB_PREFIX)) continue;
       const stale = await fs.lstat(path.join(agentDir, name)).catch(() => null);
-      if (stale && now - stale.mtimeMs > HOUR_MS) await fs.rm(path.join(agentDir, name), { recursive: true, force: true }).catch(() => {});
+      if (!stale || stale.isSymbolicLink() || now - stale.mtimeMs <= HOUR_MS) continue;
+      if (!(await isRealEntryInside(path.join(agentDir, name), managedRoot))) continue;
+      await fs.rm(path.join(agentDir, name), { recursive: true, force: true }).catch(() => {});
     }
     const homes: Array<{ home: string; activity: number }> = [];
     for (const name of names) {
@@ -116,11 +135,11 @@ export async function cleanupGeneratedCodexHomes(input: {
       const idle = now - activity;
       if (idle >= removeAfter) {
         const tombs = await detachHomeIfUnused({
-          agentDir, home, targets: [home], now, afterClaim: input.hooks?.afterClaim,
+          agentDir, home, targets: [home], now, afterClaim: input.hooks?.afterClaim, managedRoot,
           isIdle: async () => now - (await lastActivityMs(home).catch(() => now)) >= removeAfter,
         });
         if (tombs && tombs.length > 0) {
-          result.bytesFreedEstimate += await removeTombs(tombs);
+          result.bytesFreedEstimate += await removeTombs(tombs, managedRoot);
           result.removedHomes.push(home);
         }
         continue;
@@ -129,15 +148,15 @@ export async function cleanupGeneratedCodexHomes(input: {
       const targets: string[] = [];
       for (const dir of REBUILDABLE_DIRS) {
         const target = path.join(home, dir);
-        if (await fs.lstat(target).catch(() => null)) targets.push(target);
+        if (await isRealDir(target)) targets.push(target); // a symlinked plugins/cache is left alone
       }
       if (targets.length === 0) continue;
       const tombs = await detachHomeIfUnused({
-        agentDir, home, targets, now, afterClaim: input.hooks?.afterClaim,
+        agentDir, home, targets, now, afterClaim: input.hooks?.afterClaim, managedRoot,
         isIdle: async () => now - (await lastActivityMs(home).catch(() => now)) >= pruneAfter,
       });
       if (tombs && tombs.length > 0) {
-        result.bytesFreedEstimate += await removeTombs(tombs);
+        result.bytesFreedEstimate += await removeTombs(tombs, managedRoot);
         result.prunedRuntime.push(...targets);
       }
     }
