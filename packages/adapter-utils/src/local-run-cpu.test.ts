@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, foldProcRowsIntoHighWater, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -106,6 +106,19 @@ describe("local run CPU controls", () => {
     } finally {
       child.kill("SIGKILL");
     }
+  });
+
+  it("treats a recycled pid as a distinct process and charges only post-baseline CPU", () => {
+    // Deterministic identity-keying check: a warm process observed at begin (kernel starttime
+    // 100) contributes only its post-baseline delta; when the pid is recycled (starttime 200)
+    // the new process is a fresh identity whose observed work counts from zero, and the old
+    // process's retained high-water is unaffected.
+    const highWater = new Map<string, import("./local-run-cpu.js").HighWaterEntry>();
+    const row = (pid: number, starttime: number, user: number, system: number) => ({ pid, starttime, user, system });
+    foldProcRowsIntoHighWater(highWater, [row(7, 100, 50, 5)], true);  // present at begin: baseline
+    foldProcRowsIntoHighWater(highWater, [row(7, 100, 80, 9)], false); // in-window work: +30/+4
+    foldProcRowsIntoHighWater(highWater, [row(7, 200, 30, 2)], false); // recycled pid: new identity
+    expect(highWaterDeltaTotals(highWater)).toEqual({ user: 60, system: 6 });
   });
 
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {
