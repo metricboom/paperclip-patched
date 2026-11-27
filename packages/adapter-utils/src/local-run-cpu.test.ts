@@ -208,9 +208,9 @@ describe("local run CPU controls", () => {
       // A plain directory has no real cgroup cpu.stat, so setup fails after containment: the
       // group must be resumed, the directory removed, and the run must fall back without
       // claiming an enforced quota.
-      // The move-back target as a directory makes the rollback write fail with a non-ESRCH
-      // error, simulating an unwritable parent cgroup.procs.
-      await fs.mkdir(path.join(root, "cgroup.procs"));
+      // The move-back leaf's cgroup.procs as a directory makes the rollback write fail with a
+      // non-ESRCH error, simulating an unwritable release target.
+      await fs.mkdir(path.join(root, "released", "cgroup.procs"), { recursive: true });
       configureLocalRunCpuControl("cpu-cgroup-fail", { nice: 10, quotaPercent: 50 });
       const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "ignore", detached: true });
       try {

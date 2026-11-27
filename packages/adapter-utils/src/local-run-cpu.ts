@@ -280,6 +280,11 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
 // itself; the move-back target is the delegated subtree root's cgroup.procs. Best effort: the
 // whole cleanup path tolerates failure because a leftover empty cgroup directory is retried on
 // the next finish and carries no running processes after the run's tree has exited.
+// Move-back target: a dedicated leaf cgroup inside the delegated subtree. The delegated root
+// itself cannot host processes once +cpu is enabled in its subtree_control (the kernel's
+// no-internal-process constraint), and the original cgroup of a member may be outside this
+// delegation or itself process-hostile. A leaf with nothing enabled in its own subtree_control
+// can host processes and carries no cpu.max, so members land outside every run quota.
 // Returns how many member moves failed (excluding ESRCH: a process that already exited needs no
 // move). Callers must surface a nonzero count: without it, a failed rollback would leave live
 // processes confined by this run's cpu.max while the run reports a nice-only fallback.
@@ -290,10 +295,12 @@ async function releaseCgroupProcesses(directory: string) {
   // Without a delegated subtree there is no permitted move-back target; every surviving member
   // counts as failed so the caller surfaces it.
   if (!root) return { failed: members.length };
+  const leaf = `${root}/released`;
+  await fs.mkdir(leaf, { recursive: true }).catch(() => undefined);
   let failed = 0;
   for (const member of members) {
     try {
-      await fs.writeFile(`${root}/cgroup.procs`, `${member}\n`, { flag: "a" });
+      await fs.writeFile(`${leaf}/cgroup.procs`, `${member}\n`, { flag: "a" });
     } catch (error) {
       if (!isBenignProcWriteError(error)) failed += 1;
     }
