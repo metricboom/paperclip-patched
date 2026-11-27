@@ -193,19 +193,61 @@ export async function verifyLocalProcessIdentity(pid: number, expectedStarttime:
   if (expectedStarttime === null || expectedStarttime === undefined) return false;
   return await readLocalProcessStarttime(pid) === expectedStarttime;
 }
-async function tryCreateCgroup(runId: string, pid: number, quotaPercent: number) {
+function stopProcessGroup(pgid: number) { try { process.kill(-pgid, "SIGSTOP"); return true; } catch { return false; } }
+function resumeProcessGroup(pgid: number) { try { process.kill(-pgid, "SIGCONT"); } catch { /* group already gone */ } }
+async function collectProcessGroupPids(pgid: number) { return (await procStats()).filter(sample => sample.pgrp === pgid).map(sample => sample.pid); }
+// Attach-before-fork containment. The command starts before this helper runs, so a child that
+// forks during startup would escape a move of only the root pid: that descendant stays in the
+// original cgroup, outside the quota and the cpu.stat accounting. The spawned group is detached
+// and private to this run, so stop the whole group first (no member can fork while stopped; a
+// fork that already completed appears in /proc and is swept), move every member into the
+// cgroup, then resume. This preserves the spawn contract exactly: no launcher, no shell, no
+// change to command-not-found or detached/group behavior. cpu.stat covers CPU consumed after
+// containment; the milliseconds between spawn and containment are outside the cgroup (measured
+// limitation). Appends let a test on a plain filesystem observe every moved pid.
+export async function containProcessGroupInCgroup(directory: string, pid: number, pgid: number | null) {
+  if (pgid === null || pgid <= 0) {
+    await fs.writeFile(`${directory}/cgroup.procs`, `${pid}\n`, { flag: "a" });
+    return;
+  }
+  const stopped = stopProcessGroup(pgid);
+  try {
+    const moved = new Set<number>();
+    for (let pass = 0; pass < 8; pass += 1) {
+      let added = false;
+      for (const member of await collectProcessGroupPids(pgid)) {
+        if (moved.has(member)) continue;
+        moved.add(member); added = true;
+        // A member can still exit between the scan and its write; that is not containment failure.
+        await fs.writeFile(`${directory}/cgroup.procs`, `${member}\n`, { flag: "a" }).catch(() => undefined);
+      }
+      if (!added) break;
+    }
+    // The root itself is in the group it leads; this covers the rare case where the group stop
+    // failed because the root already exited but other members remain.
+    if (!moved.has(pid)) await fs.writeFile(`${directory}/cgroup.procs`, `${pid}\n`, { flag: "a" }).catch(() => undefined);
+  } finally {
+    if (stopped) resumeProcessGroup(pgid);
+  }
+}
+async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, quotaPercent: number) {
   if (process.platform !== "linux") throw new Error("cgroup v2 is only available on Linux");
   const directory = `${process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup"}/paperclip-runs/${runId}`;
-  await fs.mkdir(directory, { recursive: true });
-  await fs.writeFile(`${directory}/cpu.max`, `${Math.max(1, Math.floor(quotaPercent * 1_000))} 100000`);
-  await fs.writeFile(`${directory}/cgroup.procs`, String(pid));
-  const start = cpuStat(await fs.readFile(`${directory}/cpu.stat`, "utf8")); if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
-  return { directory, start };
+  try {
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(`${directory}/cpu.max`, `${Math.max(1, Math.floor(quotaPercent * 1_000))} 100000`);
+    await containProcessGroupInCgroup(directory, pid, pgid);
+    const start = cpuStat(await fs.readFile(`${directory}/cpu.stat`, "utf8")); if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
+    return { directory, start };
+  } catch (error) {
+    await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 export async function beginLocalRunCpuAccounting(runId: string, pid: number, processGroupId: number | null) {
   const requested = controls.get(runId) ?? { nice: null, quotaPercent: null }, startedAt = Date.now();
   let cgroup: Awaited<ReturnType<typeof tryCreateCgroup>> | null = null, fallbackReason: string | undefined, appliedNice: number | undefined;
-  if (requested.quotaPercent !== null) try { cgroup = await tryCreateCgroup(runId, pid, requested.quotaPercent); } catch (error) { fallbackReason = error instanceof Error ? error.message : String(error); }
+  if (requested.quotaPercent !== null) try { cgroup = await tryCreateCgroup(runId, pid, processGroupId, requested.quotaPercent); } catch (error) { fallbackReason = error instanceof Error ? error.message : String(error); }
   const desiredNice = requested.nice ?? (requested.quotaPercent !== null && !cgroup ? 10 : null);
   if (desiredNice !== null) try { os.setPriority(pid, desiredNice); appliedNice = desiredNice; } catch (error) { fallbackReason = [fallbackReason, error instanceof Error ? error.message : String(error)].filter(Boolean).join("; "); }
   // Non-cgroup sampling: per-process high-water accumulation keyed by pid AND kernel starttime,
@@ -238,7 +280,7 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
     if (cgroup) {
       const end = cpuStat(await fs.readFile(`${cgroup.directory}/cpu.stat`, "utf8").catch(() => ""));
       const user = end && end.user !== null && cgroup.start.user !== null ? (end.user - cgroup.start.user) / 1_000_000 : null, system = end && end.system !== null && cgroup.start.system !== null ? (end.system - cgroup.start.system) / 1_000_000 : null, cpu = end ? (end.usage - cgroup.start.usage) / 1_000_000 : null;
-      await fs.rmdir(cgroup.directory).catch(() => undefined);
+      await fs.rm(cgroup.directory, { recursive: true, force: true }).catch(() => undefined);
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
       preWindowEntrants += foldProcRowsIntoHighWater(highWater, await collectRows(), false, windowStartTicks);

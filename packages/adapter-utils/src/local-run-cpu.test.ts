@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, foldProcRowsIntoHighWater, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, containProcessGroupInCgroup, foldProcRowsIntoHighWater, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -143,6 +143,71 @@ describe("local run CPU controls", () => {
     const blind = new Map<string, import("./local-run-cpu.js").HighWaterEntry>();
     expect(foldProcRowsIntoHighWater(blind, [row(11, 42, 90, 9)], false, null)).toBe(1);
     expect(highWaterDeltaTotals(blind)).toEqual({ user: 0, system: 0 });
+  });
+
+  it("contains an immediately-forking process group in the quota cgroup before it can escape", async () => {
+    if (process.platform !== "linux") return;
+    const { spawn } = await import("node:child_process");
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cpu-cgroup-"));
+    const directory = path.join(root, "paperclip-runs", "cpu-cgroup");
+    await fs.mkdir(directory, { recursive: true });
+    // detached: the child leads its own process group, exactly as runChildProcess spawns it, and
+    // it forks a grandchild during startup - the shape that used to escape a root-pid-only move.
+    const child = spawn(process.execPath, ["-e", "require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: 'ignore' }); setTimeout(() => {}, 3000);"], { stdio: "ignore", detached: true });
+    try {
+      await new Promise((resolve) => child.on("spawn", resolve));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await containProcessGroupInCgroup(directory, child.pid!, child.pid!);
+      const moved = (await fs.readFile(path.join(directory, "cgroup.procs"), "utf8")).trim().split("\n").map(Number);
+      expect(moved).toContain(child.pid!);
+      expect(moved.length).toBeGreaterThanOrEqual(2); // the immediate grandchild was swept, not escaped
+      // The group was resumed after containment (state is the field right after the comm close).
+      const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8");
+      expect(stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[0]).not.toBe("T");
+    } finally {
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { /* gone */ }
+      child.kill("SIGKILL");
+      const fs = await import("node:fs/promises");
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes the group and removes the cgroup directory when setup fails after containment", async () => {
+    if (process.platform !== "linux") return;
+    const { spawn } = await import("node:child_process");
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cpu-cgroup-fail-"));
+    process.env.PAPERCLIP_CGROUP_ROOT = root;
+    try {
+      // A plain directory has no real cgroup cpu.stat, so setup fails after containment: the
+      // group must be resumed, the directory removed, and the run must fall back without
+      // claiming an enforced quota.
+      configureLocalRunCpuControl("cpu-cgroup-fail", { nice: 10, quotaPercent: 50 });
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "ignore", detached: true });
+      try {
+        await new Promise((resolve) => child.on("spawn", resolve));
+        const finish = await beginLocalRunCpuAccounting("cpu-cgroup-fail", child.pid!, child.pid!);
+        const accounting = await finish();
+        expect(accounting.control.quotaEnforced).toBe(false);
+        expect(accounting.quality).toBe("approximate_proc_group");
+        expect(accounting.control.fallbackReason).toContain("cpu.stat");
+        await expect(fs.stat(path.join(root, "paperclip-runs", "cpu-cgroup-fail"))).rejects.toThrow();
+        const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8");
+        expect(stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[0]).not.toBe("T");
+      } finally {
+        try { process.kill(-child.pid!, "SIGKILL"); } catch { /* gone */ }
+        child.kill("SIGKILL");
+        clearLocalRunCpuControl("cpu-cgroup-fail");
+      }
+    } finally {
+      delete process.env.PAPERCLIP_CGROUP_ROOT;
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {
