@@ -191,13 +191,62 @@ describe("claim-time host locality", () => {
 describe("host run admission", () => {
   afterEach(() => { delete process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS; warn.mockClear(); });
 
-  it("refuses a non-head local run with the ordering reason, not the slots-full reason", async () => {
+  const candidateRow = (over: Record<string, unknown> = {}) => [{ id: "run-1", companyId: "c", agentId: "a2",
+    retryOfRunId: null, contextSnapshot: null, runtimeMode: "legacy", runnerProfileJson: null, driverKind: null, ...over }];
+  const candidateAgent = (defaultEnvironmentId: string | null) =>
+    [{ companyId: "c", permissions: {}, defaultEnvironmentId }];
+
+  it("refuses behind an older eligible local head with the ordering reason, not the slots-full reason", async () => {
     process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "2";
-    const { tx } = fakeTx([agent("e1"), settings(), [{ driver: "local" }], [{ id: "run-1" }]]);
+    const { tx } = fakeTx([
+      agent("e1"), settings(), [{ driver: "local" }], // claiming run locality
+      [{ id: "run-1" }],                              // queued candidates (FIFO)
+      candidateRow(),                                 // candidate row
+      [{ count: 0 }], [{ limit: 4 }],                 // candidate agent slots free
+      candidateAgent("e1"), settings(), [{ driver: "local" }], // candidate resolves local
+    ]);
     const error = await assertAgentRunSlotFree(tx, run).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(HostRunOrderingRefused);
     expect(error).not.toBeInstanceOf(HostRunSlotsFull);
     expect((error as HostRunOrderingRefused).headRunId).toBe("run-1");
+  });
+
+  it("skips a queued head whose company is inactive (filtered by the dispatch predicate)", async () => {
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "2";
+    const { tx } = fakeTx([
+      agent(null), settings(),                        // claiming run locality (local default)
+      [{ id: "run-2" }],                              // inactive-company run-1 absent from candidates
+      [{ count: 0 }],                                 // host running count
+      [{ count: 0 }], [{ limit: 5 }],                 // claiming agent slots
+    ]);
+    await expect(assertAgentRunSlotFree(tx, run)).resolves.toBeUndefined();
+  });
+
+  it("skips a queued head whose agent has no free slots", async () => {
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "2";
+    const { tx } = fakeTx([
+      agent(null), settings(),
+      [{ id: "run-1" }, { id: "run-2" }],
+      candidateRow(),
+      [{ count: 3 }], [{ limit: 3 }],                 // candidate agent full
+      [{ count: 0 }],                                 // host running count
+      [{ count: 0 }], [{ limit: 5 }],
+    ]);
+    await expect(assertAgentRunSlotFree(tx, run)).resolves.toBeUndefined();
+  });
+
+  it("skips a queued head that resolves remote for this host", async () => {
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "2";
+    const { tx } = fakeTx([
+      agent(null), settings(),
+      [{ id: "run-1" }, { id: "run-2" }],
+      candidateRow(),
+      [{ count: 0 }], [{ limit: 4 }],
+      candidateAgent("e9"), settings(), [{ driver: "ssh" }], // candidate resolves remote
+      [{ count: 0 }],
+      [{ count: 0 }], [{ limit: 5 }],
+    ]);
+    await expect(assertAgentRunSlotFree(tx, run)).resolves.toBeUndefined();
   });
 
   it("reports the real running count when the host is full", async () => {

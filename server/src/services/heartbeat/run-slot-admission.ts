@@ -1,7 +1,7 @@
-import { agents, environmentLeases, environments, heartbeatRuns, instanceSettings, issues, type Db } from "@paperclipai/db";
+import { agents, companies, environmentLeases, environments, heartbeatRuns, instanceSettings, issues, type Db } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
 import os from "node:os";
-import { and, asc, eq, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, notInArray, sql } from "drizzle-orm";
 import { maxConcurrentRunsSql } from "./timer-policy.js";
 import { logger } from "../../middleware/logger.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -138,6 +138,23 @@ export async function hostRunProfileFor(tx: Pick<Db, "select">, run: ClaimingRun
 
 type ClaimingRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "retryOfRunId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson" | "driverKind">;
 
+function replacedRunIds(run: ClaimingRun): string[] {
+  const previousRunId = (run.contextSnapshot as Record<string, unknown> | null)?.previousRunId;
+  return [run.id, run.retryOfRunId, typeof previousRunId === "string" ? previousRunId : null]
+    .filter((id): id is string => typeof id === "string" && isUuidLike(id));
+}
+
+/** Running count and configured limit for the run's agent, or null when the agent row is gone. */
+async function agentRunSlotUsage(tx: Pick<Db, "select">, run: ClaimingRun) {
+  const [running] = await tx.select({ count: sql<number>`count(*)::int` }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running"),
+    notInArray(heartbeatRuns.id, replacedRunIds(run))));
+  const [agent] = await tx.select({ limit: maxConcurrentRunsSql() }).from(agents)
+    .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)));
+  if (!agent) return null;
+  return { running: Number(running?.count ?? 0), limit: Number(agent.limit) };
+}
+
 export async function assertAgentRunSlotFree(tx: Pick<Db, "select" | "execute">, run: ClaimingRun) {
   const hostLimit = hostRunLimit();
   // The host cap only applies to runs that execute on this host. The target is resolved at claim
@@ -146,12 +163,24 @@ export async function assertAgentRunSlotFree(tx: Pick<Db, "select" | "execute">,
   if (hostLimit !== null && !claimsRemotely) {
     const hostId = configuredHostRunId();
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:host-local-runs:${hostId}`}, 0))`);
-    const [head] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
-      .leftJoin(environments, eq(environments.id, agents.defaultEnvironmentId))
-      .where(and(eq(heartbeatRuns.status, "queued"), or(isNull(agents.defaultEnvironmentId), eq(environments.driver, "local"))))
-      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
-    if (head && head.id !== run.id) throw new HostRunOrderingRefused(hostId, head.id);
+    // FIFO among the queued runs that could actually start on this host. Eligibility mirrors
+    // dispatch (resumeQueuedRunsAfterDrain): the company is active, the agent has a free slot,
+    // and the run resolves local with the same claim-time resolution used for the claiming run.
+    // An undispatchable row is skipped instead of monopolizing host admission; order among the
+    // eligible runs is preserved, so only an eligible older local head refuses this claim.
+    const queued = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .innerJoin(companies, and(eq(companies.id, heartbeatRuns.companyId), eq(companies.status, "active")))
+      .where(eq(heartbeatRuns.status, "queued"))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+    for (const candidate of queued) {
+      if (candidate.id === run.id) break;
+      const [row] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, candidate.id)).limit(1);
+      if (!row) continue;
+      const usage = await agentRunSlotUsage(tx, row);
+      if (usage !== null && usage.running >= usage.limit) continue;
+      if (!(await resolveHostRunLocality(tx, row))) continue;
+      throw new HostRunOrderingRefused(hostId, row.id);
+    }
     // Counts runs recorded as local at their own claim. A record without a classification counts as local.
     const [runningOnHost] = await tx.select({ count: sql<number>`count(*)::int` }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.status, "running"),
@@ -160,16 +189,7 @@ export async function assertAgentRunSlotFree(tx: Pick<Db, "select" | "execute">,
     const running = Number(runningOnHost?.count ?? 0);
     if (running >= hostLimit) throw new HostRunSlotsFull(hostId, running, hostLimit);
   }
-  const previousRunId = (run.contextSnapshot as Record<string, unknown> | null)?.previousRunId;
-  const replaced = [run.id, run.retryOfRunId, typeof previousRunId === "string" ? previousRunId : null]
-    .filter((id): id is string => typeof id === "string" && isUuidLike(id));
-  const [running] = await tx.select({ count: sql<number>`count(*)::int` }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running"),
-    notInArray(heartbeatRuns.id, replaced)));
-  const [agent] = await tx.select({ limit: maxConcurrentRunsSql() }).from(agents)
-    .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)));
-  if (!agent) return;
-  const count = Number(running?.count ?? 0);
-  const limit = Number(agent.limit);
-  if (count >= limit) throw new AgentRunSlotsFull(run.agentId, count, limit);
+  const usage = await agentRunSlotUsage(tx, run);
+  if (!usage) return;
+  if (usage.running >= usage.limit) throw new AgentRunSlotsFull(run.agentId, usage.running, usage.limit);
 }
