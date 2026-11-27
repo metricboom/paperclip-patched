@@ -143,7 +143,10 @@ export async function acquireRunLease(home: string, now = Date.now()): Promise<(
         console.warn(`[home-lease] cleanup claim ${claimPath} has a dead owner; leaving it in place and waiting`);
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      // A cleanup that renames the home away mid-mkdir surfaces as ENOENT or, from a recursive
+      // mkdir racing the rename, ENOTDIR. Both mean "the home moved": step back and retry.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
         await release();
         throw error;
       }
