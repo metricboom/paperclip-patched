@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
 import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalRunCpuControl, takeLocalRunCpuAccounting, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
@@ -36,16 +36,39 @@ describe("local run CPU controls", () => {
     expect(both?.cpuSeconds).toBeGreaterThan((single?.cpuSeconds ?? 0) * 1.5);
   });
 
-  it("bounds completed accounting retention for runs that never take it", async () => {
-    // Model discovery and failed-before-result executions insert an entry per child process and
-    // never consume it; retention must stay bounded instead of growing for the process lifetime.
+  it("retains accounting only for runs registered through the dispatch path", async () => {
+    // Synthetic callers (model discovery, one-off probes) never register, so their accounting is
+    // returned to the direct caller but never retained for a consumer that does not exist. A
+    // registered heartbeat run's entry is retained until taken, unaffected by discovery volume.
     for (let i = 0; i < 300; i += 1) {
-      const finish = await beginLocalRunCpuAccounting(`cpu-leak-${i}`, process.pid, null);
-      await finish();
+      const finishDiscovery = await beginLocalRunCpuAccounting(`cpu-discovery-${i}`, process.pid, null);
+      await finishDiscovery();
     }
-    expect(takeLocalRunCpuAccounting("cpu-leak-0")).toBeNull(); // evicted once past the bound
-    expect(takeLocalRunCpuAccounting("cpu-leak-299")).not.toBeNull();
-    expect(takeLocalRunCpuAccounting("cpu-leak-299")).toBeNull();
+    expect(takeLocalRunCpuAccounting("cpu-discovery-0")).toBeNull();
+    expect(takeLocalRunCpuAccounting("cpu-discovery-299")).toBeNull();
+    configureLocalRunCpuControl("cpu-registered", readLocalRunCpuControl({ heartbeat: { cpuNice: 10 } }));
+    const finish = await beginLocalRunCpuAccounting("cpu-registered", process.pid, null);
+    await finish();
+    expect(takeLocalRunCpuAccounting("cpu-registered")).not.toBeNull();
+    expect(takeLocalRunCpuAccounting("cpu-registered")).toBeNull();
+  });
+
+  it("sweeps only retained entries whose consumer never arrives within the retention window", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+      configureLocalRunCpuControl("cpu-stale", null);
+      const finishStale = await beginLocalRunCpuAccounting("cpu-stale", process.pid, null);
+      await finishStale();
+      vi.setSystemTime(new Date("2026-01-01T02:00:00Z"));
+      configureLocalRunCpuControl("cpu-fresh", null);
+      const finishFresh = await beginLocalRunCpuAccounting("cpu-fresh", process.pid, null);
+      await finishFresh();
+      expect(takeLocalRunCpuAccounting("cpu-stale")).toBeNull();
+      expect(takeLocalRunCpuAccounting("cpu-fresh")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

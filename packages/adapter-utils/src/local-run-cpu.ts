@@ -9,21 +9,27 @@ export interface LocalRunCpuAccounting {
   control: { requestedQuotaPercent: number | null; requestedNice: number | null; method: "cgroup_v2" | "nice" | "none"; quotaEnforced: boolean; fallbackReason?: string; appliedNice?: number; };
 }
 const controls = new Map<string, LocalRunCpuControl>();
+// Runs dispatched through the heartbeat runtime register here: configureLocalRunCpuControl is
+// called for every dispatch, with a null control for remote targets, and clearLocalRunCpuControl
+// unregisters when the dispatch unwinds. Only runs inside that window have their accounting
+// retained for takeLocalRunCpuAccounting. Synthetic callers such as model discovery never
+// register, so their per-process entries are returned to the direct caller but never retained at
+// all. Entries whose consumer never arrives (a run that fails before result handling) are swept
+// after COMPLETED_RETENTION_MS, so retention is bounded by lifetime, never by volume: a
+// legitimate consumer takes its entry right after the run's result is handled, far inside the
+// window, so no real run's accounting can be evicted by other callers' activity.
+const registered = new Set<string>();
 const completed = new Map<string, LocalRunCpuAccounting>();
-// Bounded retention: callers that never take their accounting (model discovery, processes that
-// fail before result handling) would otherwise grow this map for the life of the process. Real
-// heartbeat consumers take their entry promptly after the run ends, so evicting the oldest entry
-// past a generous bound loses nothing they would have read.
-const COMPLETED_ACCOUNTING_LIMIT = 256;
+const completedAt = new Map<string, number>();
+const COMPLETED_RETENTION_MS = 60 * 60_000;
 function rememberCompleted(runId: string, accounting: LocalRunCpuAccounting) {
-  if (!completed.has(runId)) {
-    while (completed.size >= COMPLETED_ACCOUNTING_LIMIT) {
-      const oldest = completed.keys().next().value;
-      if (oldest === undefined) break;
-      completed.delete(oldest);
-    }
+  if (!registered.has(runId)) return;
+  const now = Date.now();
+  for (const [id, at] of completedAt) {
+    if (now - at > COMPLETED_RETENTION_MS) { completed.delete(id); completedAt.delete(id); registered.delete(id); }
   }
   completed.set(runId, accounting);
+  completedAt.set(runId, now);
 }
 const PROC_TICKS_PER_SECOND = 100;
 function numberInRange(value: unknown, min: number, max: number) { return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= min && value <= max ? value : null; }
@@ -33,9 +39,9 @@ export function readLocalRunCpuControl(runtimeConfig: unknown): LocalRunCpuContr
   const nice = numberInRange(heartbeat.cpuNice, -20, 19), quotaPercent = numberInRange(heartbeat.cpuQuotaPercent, 1, 1_000);
   return nice === null && quotaPercent === null ? null : { nice, quotaPercent };
 }
-export function configureLocalRunCpuControl(runId: string, control: LocalRunCpuControl | null) { if (control) controls.set(runId, control); else controls.delete(runId); }
-export function clearLocalRunCpuControl(runId: string) { controls.delete(runId); }
-export function takeLocalRunCpuAccounting(runId: string) { const accounting = completed.get(runId) ?? null; completed.delete(runId); return accounting; }
+export function configureLocalRunCpuControl(runId: string, control: LocalRunCpuControl | null) { registered.add(runId); if (control) controls.set(runId, control); else controls.delete(runId); }
+export function clearLocalRunCpuControl(runId: string) { registered.delete(runId); controls.delete(runId); }
+export function takeLocalRunCpuAccounting(runId: string) { completedAt.delete(runId); const accounting = completed.get(runId) ?? null; completed.delete(runId); return accounting; }
 const addNullable = (a: number | null, b: number | null) => a === null && b === null ? null : (a ?? 0) + (b ?? 0);
 const methodRank = { none: 0, nice: 1, cgroup_v2: 2 } as const;
 /**
