@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, containProcessGroupInCgroup, foldProcRowsIntoHighWater, isBenignProcWriteError, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, containProcessGroupInCgroup, finalizeCpuSeconds, foldProcRowsIntoHighWater, isBenignProcWriteError, highWaterDeltaTotals, mergeLocalRunCpuAccounting, readLocalProcessStarttime, readLocalRunCpuControl, takeLocalRunCpuAccounting, verifyLocalProcessIdentity, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -250,6 +250,13 @@ describe("local run CPU controls", () => {
     expect(accounting.quality).toBe("approximate_proc_group");
     expect(accounting.control.fallbackReason).toContain("PAPERCLIP_CGROUP_ROOT");
     clearLocalRunCpuControl("cpu-nodelegation");
+  });
+
+  it("reports CPU measurements as null when no supported accounting backend exists", () => {
+    // Non-Linux hosts have no /proc sampler; an unavailable measurement must persist as null,
+    // never as a zero that is indistinguishable from an idle run.
+    expect(finalizeCpuSeconds(null)).toEqual({ userCpuSeconds: null, systemCpuSeconds: null, cpuSeconds: null });
+    expect(finalizeCpuSeconds({ user: 100, system: 50 })).toEqual({ userCpuSeconds: 1, systemCpuSeconds: 0.5, cpuSeconds: 1.5 });
   });
 
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {

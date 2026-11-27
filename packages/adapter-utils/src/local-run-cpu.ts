@@ -174,6 +174,16 @@ export function foldProcRowsIntoHighWater(highWater: Map<string, HighWaterEntry>
   }
   return preWindowEntrants;
 }
+// CPU seconds from sampled totals; null when no supported accounting backend exists (non-Linux
+// hosts have no /proc sampler), so an unavailable measurement is never persisted as zero and
+// confused with a genuinely idle run.
+export function finalizeCpuSeconds(end: { user: number; system: number } | null) {
+  return {
+    userCpuSeconds: end ? end.user / PROC_TICKS_PER_SECOND : null,
+    systemCpuSeconds: end ? end.system / PROC_TICKS_PER_SECOND : null,
+    cpuSeconds: end ? (end.user + end.system) / PROC_TICKS_PER_SECOND : null,
+  };
+}
 export function highWaterDeltaTotals(highWater: Map<string, HighWaterEntry>) {
   let user = 0, system = 0;
   for (const entry of highWater.values()) {
@@ -351,8 +361,10 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
   let preWindowEntrants = 0;
   const collectRows = processGroupId ? () => processGroupRows(processGroupId) : () => processTreeRows(pid);
   const highWater = new Map<string, HighWaterEntry>();
-  foldProcRowsIntoHighWater(highWater, await collectRows(), true, windowStartTicks);
-  const sampler = setInterval(() => { void collectRows().then(rows => { preWindowEntrants += foldProcRowsIntoHighWater(highWater, rows, false, windowStartTicks); }); }, 250); sampler.unref();
+  const samplingSupported = process.platform === "linux";
+  if (samplingSupported) foldProcRowsIntoHighWater(highWater, await collectRows(), true, windowStartTicks);
+  const sampler = samplingSupported ? setInterval(() => { void collectRows().then(rows => { preWindowEntrants += foldProcRowsIntoHighWater(highWater, rows, false, windowStartTicks); }); }, 250) : null;
+  if (sampler) sampler.unref();
   return async () => {
     if (sampler) clearInterval(sampler); const wallSeconds = (Date.now() - startedAt) / 1_000;
     let result: LocalRunCpuAccounting;
@@ -367,9 +379,9 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
         : undefined;
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, ...(cleanupWarning ? { cleanupWarning } : {}), control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
-      preWindowEntrants += foldProcRowsIntoHighWater(highWater, await collectRows(), false, windowStartTicks);
-      const end = highWaterDeltaTotals(highWater), userCpuSeconds = end.user / PROC_TICKS_PER_SECOND, systemCpuSeconds = end.system / PROC_TICKS_PER_SECOND;
-      result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, ...(preWindowEntrants > 0 ? { unmeasuredPriorCpuProcesses: preWindowEntrants } : {}), control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
+      if (samplingSupported) preWindowEntrants += foldProcRowsIntoHighWater(highWater, await collectRows(), false, windowStartTicks);
+      const { userCpuSeconds, systemCpuSeconds, cpuSeconds } = finalizeCpuSeconds(samplingSupported ? highWaterDeltaTotals(highWater) : null);
+      result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds, wallSeconds, ...(preWindowEntrants > 0 ? { unmeasuredPriorCpuProcesses: preWindowEntrants } : {}), control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
     const merged = mergeLocalRunCpuAccounting(completed.get(runId)?.accounting ?? null, result);
     rememberCompleted(runId, merged); return merged;
