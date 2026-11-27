@@ -163,9 +163,77 @@ function scopedToolRequestGuidance(connectionId: string, catalog: ReadonlyArray<
   return `Call connection_request again with connectionId ${JSON.stringify(connectionId)} and toolNames set to only the exact names this task needs. Available indexed tool names (first ${listed.length} of ${names.length}): ${JSON.stringify(listed)}. No access was granted.`;
 }
 
-export function connectionIntentService(db: Db) {
+/** Overall budget for one connections_search call; well inside Cloudflare's 120 s origin limit. */
+export const DISCOVERY_DEADLINE_MS = 60_000;
+/** Services (and aggregator providers) evaluated at once during one search. */
+const DISCOVERY_CONCURRENCY = 4;
+
+export function discoveryTimedOut(deadlineMs: number) {
+  return new HttpError(504, `Connection discovery did not finish within ${Math.round(deadlineMs / 1000)} seconds. Try a narrower search, or retry later.`, {
+    code: "discovery_timed_out",
+    deadlineMs,
+  });
+}
+
+/** Ordered, bounded fan-out. Stops issuing work once the signal aborts or a mapper fails. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+  signal?: AbortSignal,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  let failed = false;
+  async function worker() {
+    while (!failed && nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        signal?.throwIfAborted();
+        results[index] = await mapper(items[index]!);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  }
+  const workers = await Promise.allSettled(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
+  );
+  const failure = workers.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+  signal?.throwIfAborted();
+  return results;
+}
+
+type ToolAccess = ReturnType<typeof toolAccessService>;
+type ConnectionGrantList = Awaited<ReturnType<ToolAccess["listConnectionGrants"]>>;
+type EffectiveToolAssignments = Awaited<ReturnType<ToolAccess["getEffectiveToolAssignmentsForAgent"]>>;
+type DiscoveryCatalogEntry = Pick<typeof toolCatalogEntries.$inferSelect, "toolName" | "description" | "status" | "lastSeenAt" | "entryKind">;
+
+/**
+ * Data that discovery reads repeatedly. One search shares a memoised set so
+ * each connection's grants and catalog, and the agent's effective assignments,
+ * are read at most once per call; every read first checks the deadline.
+ */
+type DiscoveryLoaders = {
+  grants(connectionId: string, companyId: string): Promise<ConnectionGrantList>;
+  effectiveAssignments(companyId: string, agentId: string): Promise<EffectiveToolAssignments>;
+  catalog(connectionId: string, companyId: string): Promise<DiscoveryCatalogEntry[]>;
+  checkpoint(): void;
+};
+
+export type ConnectionIntentServiceOptions = {
+  /** Test seam: a shortened discovery deadline. */
+  discoveryDeadlineMs?: number;
+  /** Test seam: the tool-access service, so reads can be counted. */
+  toolAccess?: ToolAccess;
+};
+
+export function connectionIntentService(db: Db, serviceOptions: ConnectionIntentServiceOptions = {}) {
   const interactions = issueThreadInteractionService(db);
-  const access = toolAccessService(db);
+  const access = serviceOptions.toolAccess ?? toolAccessService(db);
 
   async function assertCurrentUserWriteAccess(
     companyId: string,
@@ -384,7 +452,10 @@ export function connectionIntentService(db: Db) {
     // has to see the cause, not just the responsible user, to answer the same
     // question the credential path answers.
     executionIdentity?: { cause: string; responsibleUserId: string | null } | null;
+    /** Discovery's shared per-search reads; other callers read directly. */
+    loaders?: DiscoveryLoaders;
   }) {
+    const loaders = input.loaders ?? directLoaders();
     const managed = input.purpose === "ai" ? await managedAgent(input.companyId, input.agentId, input.serviceSlug, { sourceRunId: input.sourceRunId, agentSetup: input.agentSetup, agentSetupOperationId: input.agentSetupOperationId }) : null;
     if (managed) {
       try {
@@ -404,6 +475,7 @@ export function connectionIntentService(db: Db) {
       && connection.status !== "archived" && connection.connectionPurpose !== "ai"
     );
     if (matching.length === 0) return null;
+    loaders.checkpoint();
     const effective = await access.getConnectionAssignmentsForAgent(input.companyId, input.agentId, matching.map(connection => connection.id));
     const installedIds = new Set(effective.installedConnections.map((connection) => connection.id));
     const permittedIds = new Set(effective.allowedConnectionIds);
@@ -429,7 +501,7 @@ export function connectionIntentService(db: Db) {
     const installed = matching.filter((connection) => installedIds.has(connection.id));
     const grantsByConnection = await Promise.all(installed.map(async (connection) => ({
       connection,
-      grants: (await access.listConnectionGrants(connection.id, input.companyId)).grants,
+      grants: (await loaders.grants(connection.id, input.companyId)).grants,
     })));
 
     // Keep readiness aligned with runtime identity resolution. A dedicated
@@ -458,14 +530,60 @@ export function connectionIntentService(db: Db) {
     return activeOrganization.length === 1 ? usable(activeOrganization[0]!.connection) : null;
   }
 
-  async function administrativeDenial(companyId: string, agentId: string, serviceSlug: string, inventory: Awaited<ReturnType<typeof connectionInventory>>) {
-    const effective = await access.getEffectiveToolAssignmentsForAgent(companyId, agentId);
+  async function administrativeDenial(companyId: string, agentId: string, serviceSlug: string, inventory: Awaited<ReturnType<typeof connectionInventory>>, loaders: DiscoveryLoaders = directLoaders()) {
+    const effective = await loaders.effectiveAssignments(companyId, agentId);
     const installed = effective.installedConnections.filter((connection) => sourceSlugForConnection(connection, inventory.applicationsById) === serviceSlug);
     if (!installed.length || effective.allowedTools.some((tool) => installed.some((connection) => connection.id === tool.connectionId))) return false;
     for (const connection of installed) {
-      if ((await indexedCatalog(connection.id, companyId)).some((tool) => tool.entryKind === "tool")) return true;
+      if ((await loaders.catalog(connection.id, companyId)).some((tool) => tool.entryKind === "tool")) return true;
     }
     return false;
+  }
+
+  /** Discovery's catalog read: index text and freshness only, never the tool schemas. */
+  function discoveryCatalog(connectionId: string, companyId: string): Promise<DiscoveryCatalogEntry[]> {
+    return db.select({
+      toolName: toolCatalogEntries.toolName,
+      description: toolCatalogEntries.description,
+      status: toolCatalogEntries.status,
+      lastSeenAt: toolCatalogEntries.lastSeenAt,
+      entryKind: toolCatalogEntries.entryKind,
+    }).from(toolCatalogEntries).where(and(
+      eq(toolCatalogEntries.companyId, companyId), eq(toolCatalogEntries.connectionId, connectionId),
+      eq(toolCatalogEntries.status, "active"),
+    ));
+  }
+
+  /** Unshared reads for callers outside one discovery call. */
+  function directLoaders(): DiscoveryLoaders {
+    return {
+      grants: (connectionId, companyId) => access.listConnectionGrants(connectionId, companyId),
+      effectiveAssignments: (companyId, agentId) => access.getEffectiveToolAssignmentsForAgent(companyId, agentId),
+      catalog: discoveryCatalog,
+      checkpoint: () => {},
+    };
+  }
+
+  /** Memoised reads for one search; each read first checks the deadline signal. */
+  function searchLoaders(signal: AbortSignal): DiscoveryLoaders {
+    const grants = new Map<string, Promise<ConnectionGrantList>>();
+    const catalogs = new Map<string, Promise<DiscoveryCatalogEntry[]>>();
+    const effective = new Map<string, Promise<EffectiveToolAssignments>>();
+    const memo = <T>(cache: Map<string, Promise<T>>, key: string, load: () => Promise<T>) => {
+      signal.throwIfAborted();
+      let pending = cache.get(key);
+      if (!pending) {
+        pending = load();
+        cache.set(key, pending);
+      }
+      return pending;
+    };
+    return {
+      grants: (connectionId, companyId) => memo(grants, `${companyId}:${connectionId}`, () => access.listConnectionGrants(connectionId, companyId)),
+      effectiveAssignments: (companyId, agentId) => memo(effective, `${companyId}:${agentId}`, () => access.getEffectiveToolAssignmentsForAgent(companyId, agentId)),
+      catalog: (connectionId, companyId) => memo(catalogs, `${companyId}:${connectionId}`, () => discoveryCatalog(connectionId, companyId)),
+      checkpoint: () => signal.throwIfAborted(),
+    };
   }
 
   function indexedCatalog(connectionId: string, companyId: string) {
@@ -484,11 +602,13 @@ export function connectionIntentService(db: Db) {
     } } }).assignedInboxes(companyId, agentId);
   }
 
-  async function resolveService(service: string, companyId: string, userId: string, agentId: string, purpose?: "ai" | "channel") {
+  async function resolveService(service: string, companyId: string, userId: string, agentId: string, purpose?: "ai" | "channel",
+    shared: { experimental?: Awaited<ReturnType<ReturnType<typeof instanceSettingsService>["getExperimental"]>>; loaders?: DiscoveryLoaders } = {}) {
+    const experimental = async () => shared.experimental ?? await instanceSettingsService(db).getExperimental();
     if (!service.startsWith("connection:")) {
       const app = getAppStoreDefinition(purpose === "ai" ? aiConnectionCatalogSlug(service) : service);
       if (!app) throw notFound("Connection service was not found");
-      if (app.experimentalFeatureKey && !isConnectorFeatureEnabled(app, await instanceSettingsService(db).getExperimental())) {
+      if (app.experimentalFeatureKey && !isConnectorFeatureEnabled(app, await experimental())) {
         throw notFound("Connection service was not found");
       }
       if (purpose === "channel" && !getAvailableConnectionMethods(app).some(method => method.purpose === "channel")) {
@@ -508,9 +628,10 @@ export function connectionIntentService(db: Db) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
       throw notFound("Configured connection was not found");
     }
+    shared.loaders?.checkpoint();
     const connection = await access.getConnection(id, companyId);
     if (connection.connectionPurpose === "ai" && purpose !== "ai") throw notFound("AI authentication is not a tool connection");
-    const { grants } = await access.listConnectionGrants(id, companyId);
+    const { grants } = shared.loaders ? await shared.loaders.grants(id, companyId) : await access.listConnectionGrants(id, companyId);
     if (connection.status === "archived" || !grants.some((grant) => grant.status === "active" && (
       grant.kind === "organization" || (grant.kind === "user" && grant.subjectUserId === userId)
       || (grant.kind === "agent" && grant.subjectAgentId === agentId)
@@ -521,7 +642,7 @@ export function connectionIntentService(db: Db) {
       : typeof connection.config?.sourceTemplateKey === "string"
         ? getAppStoreDefinition(connection.config?.sourceTemplateKey) : null;
     if (definition?.experimentalFeatureKey && !isConnectorFeatureEnabled(definition,
-      await instanceSettingsService(db).getExperimental())) {
+      await experimental())) {
       throw notFound("Configured connection was not found");
     }
     return {
@@ -534,17 +655,44 @@ export function connectionIntentService(db: Db) {
     };
   }
 
+  /**
+   * Discovery answers within DISCOVERY_DEADLINE_MS or fails with a 504
+   * `discovery_timed_out`. On expiry the shared signal aborts, so no further
+   * discovery reads are issued for this call.
+   */
   async function search(claims: ConnectionRunClaims, query: string, options: { retryProviderChoice?: boolean } = {}): Promise<ConnectionsSearchResult> {
+    const deadlineMs = serviceOptions.discoveryDeadlineMs ?? DISCOVERY_DEADLINE_MS;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = discoveryTimedOut(deadlineMs);
+        controller.abort(error);
+        reject(error);
+      }, deadlineMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([searchWithin(claims, query, options, searchLoaders(controller.signal), controller.signal), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function searchWithin(claims: ConnectionRunClaims, query: string, options: { retryProviderChoice?: boolean }, loaders: DiscoveryLoaders, signal: AbortSignal): Promise<ConnectionsSearchResult> {
     const { run, agent, issue, executionIdentity } = await loadRunContext(claims);
+    loaders.checkpoint();
     const settings = await instanceSettingsService(db).getExperimental();
+    loaders.checkpoint();
     const [company] = await db.select({ prefix: companies.issuePrefix }).from(companies).where(eq(companies.id, run.companyId));
     if (!company) throw notFound("Company was not found");
     const explicit = explicitAggregatorQuery(query);
     const serviceQuery = explicit?.serviceQuery ?? query;
     const preparedQuery = prepareConnectionSearch(serviceQuery);
+    loaders.checkpoint();
     const inventory = await connectionInventory(run.companyId);
     const candidates: Array<{ item: ConnectionSearchResultItem; score: number; nameScore: number }> = [];
-    const authorizedCatalogs = new Map<string, Awaited<ReturnType<typeof indexedCatalog>>>();
+    const authorizedCatalogs = new Map<string, DiscoveryCatalogEntry[]>();
     // New setup of these native services is offered through aggregators instead.
     const yieldsToAggregators = createNativeConnectorYield(settings);
     const yieldingServices = new Set<string>();
@@ -556,10 +704,46 @@ export function connectionIntentService(db: Db) {
       ...inventory.connections.filter((connection) =>
         sourceSlugForConnection(connection, inventory.applicationsById)?.startsWith("connection:")
         && connection.status !== "archived").map((connection) => `connection:${connection.id}`)];
-    for (const service of services) {
+    const shared = { experimental: settings, loaders };
+    const providerReadiness = new Map<string, ReturnType<typeof usableConnectionForAgent>>();
+    // Configured connections carry indexed tool text, so they are always read
+    // (within this caller's grant audience). A service with no saved
+    // connection is scored from its name and description alone, and only a
+    // matching service goes on to readiness, denial and capability reads.
+    const audienceCatalogs = async (matching: ToolConnection[]) => {
+      const reauthorizationRequired: ToolConnection[] = [];
+      const catalogs = await Promise.all(matching.map(async (connection) => {
+        const { grants } = await loaders.grants(connection.id, run.companyId);
+        const audience = grants.filter((grant) =>
+          grant.kind === "organization" || (grant.kind === "user" && grant.subjectUserId === run.responsibleUserId)
+          || (grant.kind === "agent" && grant.subjectAgentId === agent.id));
+        const authorized = audience.some((grant) => grant.status === "active");
+        // A rejected refresh marks the grant. Name only connections in this
+        // caller's audience so the agent can report the exact human action.
+        if (!authorized && audience.some((grant) => grant.status === "needs_reauthorization")) reauthorizationRequired.push(connection);
+        const entries = authorized ? await loaders.catalog(connection.id, run.companyId) : [];
+        return { connection, entries };
+      }));
+      return { catalogs, reauthorizationRequired };
+    };
+    const evaluateService = async (service: string): Promise<{ candidate: (typeof candidates)[number]; yielding: boolean } | null> => {
+      loaders.checkpoint();
       let app;
-      try { app = await resolveService(service, run.companyId, run.responsibleUserId!, agent.id); }
-      catch (error) { if (service.startsWith("connection:") && (error as { status?: number }).status === 404) continue; throw error; }
+      let configured: Awaited<ReturnType<typeof audienceCatalogs>> | undefined;
+      if (service.startsWith("connection:")) {
+        // A saved connection is scored from inventory and its own indexed tools
+        // before resolveService reads the connection again.
+        const saved = inventory.connections.find(connection => `connection:${connection.id}` === service);
+        const matching = saved && saved.connectionPurpose !== "ai" ? [saved] : [];
+        configured = await audienceCatalogs(matching);
+        const catalog = configured.catalogs.flatMap(({ entries }) => entries).filter((entry) => entry.status === "active");
+        const application = saved ? inventory.applicationsById.get(saved.applicationId) : undefined;
+        const preliminary = scoreConnectionSearch(preparedQuery, [service, saved?.name ?? ""],
+          `${application?.description ?? ""}  ${catalog.map(tool => `${tool.toolName} ${tool.description ?? ""}`).join(" ")}`);
+        if (!preliminary.score) return null;
+      }
+      try { app = await resolveService(service, run.companyId, run.responsibleUserId!, agent.id, undefined, shared); }
+      catch (error) { if (service.startsWith("connection:") && (error as { status?: number }).status === 404) return null; throw error; }
       const definition = getAppStoreDefinition(service);
       if (definition) {
         const methods = discoveryMethods(definition);
@@ -578,32 +762,22 @@ export function connectionIntentService(db: Db) {
         && (aiOnly ? connection.connectionPurpose === "ai" : connection.connectionPurpose !== "ai"));
       // Indexed descriptions can contain private workspace metadata, including
       // for catalog providers. Check each configured connection's audience first.
-      const reauthorizationRequired: ToolConnection[] = [];
-      const catalogs = await Promise.all(matching.map(async (connection) => {
-        const { grants } = await access.listConnectionGrants(connection.id, run.companyId);
-        const audience = grants.filter((grant) =>
-          grant.kind === "organization" || (grant.kind === "user" && grant.subjectUserId === run.responsibleUserId)
-          || (grant.kind === "agent" && grant.subjectAgentId === agent.id));
-        const authorized = audience.some((grant) => grant.status === "active");
-        // A rejected refresh marks the grant. Name only connections in this
-        // caller's audience so the agent can report the exact human action.
-        if (!authorized && audience.some((grant) => grant.status === "needs_reauthorization")) reauthorizationRequired.push(connection);
-        const entries = authorized ? await indexedCatalog(connection.id, run.companyId) : [];
-        authorizedCatalogs.set(connection.id, entries);
-        return entries;
-      }));
-      const catalog = catalogs.flat().filter((entry) => entry.status === "active");
+      const { catalogs, reauthorizationRequired } = configured ?? await audienceCatalogs(matching);
+      for (const { connection, entries } of catalogs) authorizedCatalogs.set(connection.id, entries);
+      const catalog = catalogs.flatMap(({ entries }) => entries).filter((entry) => entry.status === "active");
       const { score, nameScore } = scoreConnectionSearch(preparedQuery, [app.slug, app.name],
         `${app.description ?? ""} ${app.searchCapabilities} ${catalog.map(tool => `${tool.toolName} ${tool.description ?? ""}`).join(" ")}`);
-      if (!score) continue;
-      if (definition && !matching.length && yieldsToAggregators(definition)) yieldingServices.add(service);
+      if (!score) return null;
+      const yielding = Boolean(definition && !matching.length && yieldsToAggregators(definition));
+      loaders.checkpoint();
       const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
-        responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory, executionIdentity });
-      const denied = !aiOnly && !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory);
+        responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory, executionIdentity, loaders });
+      const denied = !aiOnly && !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory, loaders);
       // Naming the cause keeps the downgrade actionable: the connection is fine,
       // so "review identity and access" would send the caller to reconnect it.
       const identityWithheld = !ready && !denied && matching.length > 0
         && service === "github" && executionIdentity?.cause === "company_default";
+      loaders.checkpoint();
       const methods = await Promise.all(app.methods.map(async method => {
         const declaredPurpose = definition ? discoveryMethods(definition).find(candidate => candidate.key === method.key)?.purpose : undefined;
         const purpose = declaredPurpose === "channel" ? "chat" : declaredPurpose === "ai" ? "ai" : "tool";
@@ -621,7 +795,7 @@ export function connectionIntentService(db: Db) {
           nextApiOperation: purpose === "chat" ? "POST /api/companies/{companyId}/chat-endpoints"
             : purpose === "ai" ? "POST /api/companies/{companyId}/ai-connections" : "POST /api/companies/{companyId}/tools/apps/connect" } };
       }));
-      candidates.push({ score, nameScore, item: {
+      return { yielding, candidate: { score, nameScore, item: {
         service, name: app.name, description: app.description ?? null, logoUrl: app.branding.logoUrl ?? null,
         methods, source: app.source,
         state: ready ? "ready" : (denied && !isRemoteMcpConnectorId(service)) || !app.available || !app.methods.length ? "unavailable"
@@ -632,7 +806,13 @@ export function connectionIntentService(db: Db) {
           : matching.some((connection) => isToolConnectionAttentionHealth(connection.healthStatus)) ? "Connection needs attention"
           : matching.length ? "Review identity and access for this agent" : "Connect this service to continue",
         connectionId: ready?.id ?? null,
-      }});
+      }} };
+    };
+    // Bounded fan-out; results are collected in service order, as before.
+    for (const evaluated of await mapWithConcurrency(services, DISCOVERY_CONCURRENCY, evaluateService, signal)) {
+      if (!evaluated) continue;
+      if (evaluated.yielding) yieldingServices.add(evaluated.candidate.item.service);
+      candidates.push(evaluated.candidate);
     }
     if (!settings.enableChatConnectors) for (const app of APP_STORE_DEFINITIONS) {
       if (!isConnectorFeatureEnabled(app, settings) || discoveryMethods(app).length || findAggregatorService(app.slug) || findAggregatorService(app.name)
@@ -696,6 +876,7 @@ export function connectionIntentService(db: Db) {
       const results = ranked();
       if (results.some(item => item.source === "aggregator")) return discoverySuggestions(results);
       // Only a single unconnected tool result can tell the agent to configure it.
+      loaders.checkpoint();
       const setupRequested = !suggestions && results.length === 1
         && await latestHumanMessageRequestsSetup(run.companyId, issue.id, run.responsibleUserId!, results[0]!);
       return directSearchResult(query, results, company.prefix, suggestions, setupRequested);
@@ -703,6 +884,7 @@ export function connectionIntentService(db: Db) {
     const targetService = publicService?.slug ?? (indexedMatches.length === 1 ? indexedMatches[0]!.slug : normalizeConnectionQuery(serviceQuery).replaceAll(" ", "-"));
     // Indexed-only app labels must be identical when requests re-search the slug.
     const targetName = publicService?.name ?? targetService.split("-").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+    loaders.checkpoint();
     const previous = await providerSelections(run.companyId, issue.id, agent.id, run.responsibleUserId!, `connection-provider:${targetService}`);
     const explicitConsent = explicit && await hasExplicitProviderRequest(run.companyId, issue.id, run.responsibleUserId!, targetService, explicit.provider, previous[0]);
     if (exact.length && (!explicitConsent || exact.some(({ item }) => item.state === "unavailable"))) {
@@ -712,22 +894,23 @@ export function connectionIntentService(db: Db) {
         item.service === service.slug || [service.name, ...service.aliases].some(name =>
           scoreConnectionSearch(name, [item.name]).nameScore === 1000)));
       if (otherApps.length && !exact.some(({ item }) => item.state === "unavailable")) {
-        const otherRoutes = (await Promise.all(otherApps.slice(0, 10).map(({ service }) =>
-          aggregatorAlternatives(service.slug, service.name, service)))).flat();
+        const otherRoutes = (await mapWithConcurrency(otherApps.slice(0, 10), DISCOVERY_CONCURRENCY, ({ service }) =>
+          aggregatorAlternatives(service.slug, service.name, service), signal)).flat();
         if (otherRoutes.length) return discoverySuggestions([...ranked(), ...otherRoutes]);
       }
       return rankedResult();
     }
-    async function aggregatorAlternatives(targetService: string, targetName: string, publicService?: AggregatorServiceDefinition) {
-      const alternatives: ConnectionSearchResultItem[] = [];
-      if (/^[a-z0-9][a-z0-9-]{0,79}$/.test(targetService)) {
-        for (const provider of AGGREGATOR_PRIORITY) {
+    async function aggregatorAlternatives(targetService: string, targetName: string, publicService?: AggregatorServiceDefinition): Promise<ConnectionSearchResultItem[]> {
+      if (!/^[a-z0-9][a-z0-9-]{0,79}$/.test(targetService)) return [];
+      // Providers are evaluated with bounded concurrency and kept in priority order.
+      const evaluated = await mapWithConcurrency(AGGREGATOR_PRIORITY, DISCOVERY_CONCURRENCY, async (provider): Promise<ConnectionSearchResultItem | null> => {
+          loaders.checkpoint();
           // Broad execute/search descriptions are not evidence of app support. Only a
           // namespaced action (or an explicitly listed Executor integration) qualifies.
           const connections = inventory.connections.filter(connection => connection.status !== "archived" && connection.enabled && sourceSlugForConnection(connection, inventory.applicationsById) === provider);
           let indexedAt: Date | undefined;
           for (const connection of connections) {
-            const { grants } = await access.listConnectionGrants(connection.id, run.companyId);
+            const { grants } = await loaders.grants(connection.id, run.companyId);
             if (!grants.some(grant => grant.status === "active" && (grant.kind === "organization"
               || grant.kind === "user" && grant.subjectUserId === run.responsibleUserId
               || grant.kind === "agent" && grant.subjectAgentId === agent.id))) continue;
@@ -742,12 +925,19 @@ export function connectionIntentService(db: Db) {
           }
           const publishedAt = publicService ? (publicService.providers as Partial<Record<string, string>>)[provider] : undefined;
           const published = Boolean(publishedAt);
-          if (!published && !indexedAt) continue;
-          if (await administrativeDenial(run.companyId, agent.id, provider, inventory)) continue;
-          const app = await resolveService(provider, run.companyId, run.responsibleUserId!, agent.id);
-          if (!app.available || !app.methods.length) continue;
-          const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id, responsibleUserId: run.responsibleUserId!, serviceSlug: provider, inventory });
-          alternatives.push({
+          if (!published && !indexedAt) return null;
+          if (await administrativeDenial(run.companyId, agent.id, provider, inventory, loaders)) return null;
+          const app = await resolveService(provider, run.companyId, run.responsibleUserId!, agent.id, undefined, shared);
+          if (!app.available || !app.methods.length) return null;
+          loaders.checkpoint();
+          // A provider's readiness does not depend on the target app; read it once per search.
+          let readiness = providerReadiness.get(provider);
+          if (!readiness) {
+            readiness = usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id, responsibleUserId: run.responsibleUserId!, serviceSlug: provider, inventory, loaders });
+            providerReadiness.set(provider, readiness);
+          }
+          const ready = await readiness;
+          return {
             service: `via:${provider}:${targetService}`, name: `${targetName} through ${app.name}`,
             source: "aggregator", state: "available", description: `Connect ${targetName} through ${app.name}, an external service.`,
             logoUrl: app.branding.logoUrl ?? null, methods: app.methods, connectionId: ready?.id ?? null,
@@ -757,10 +947,9 @@ export function connectionIntentService(db: Db) {
             aggregator: { provider, targetService, targetName, evidenceUrl: published ? publicService?.evidenceUrls?.[provider] ?? AGGREGATOR_CATALOG_SOURCES[provider] ?? null : null,
               verifiedAt: publishedAt ?? indexedAt!.toISOString(),
               readiness: ready ? "requires_app_verification" : "requires_provider_setup" },
-          });
-        }
-      }
-      return alternatives;
+          };
+      }, signal);
+      return evaluated.filter((item): item is ConnectionSearchResultItem => item !== null);
     }
     const alternatives = await aggregatorAlternatives(targetService, targetName, publicService);
     // A typo/prefix match is a discovery hint, not a selected app. Generic
@@ -778,8 +967,8 @@ export function connectionIntentService(db: Db) {
         instruction: `The user explicitly requested ${AGGREGATOR_NAMES[explicit.provider]}. Disclose that this external service handles the connection and requests to ${targetName}. Do not ask another provider-choice question or substitute another provider. Call connection_request with service ${explicit.provider} and targetService ${targetService}. Follow its returned instruction; app authorization is not yet verified.` };
     }
     if (!alternatives.length && bestMatches.length > 1) {
-      const matches = (await Promise.all(bestMatches.slice(0, 10).map(({ service }) =>
-        aggregatorAlternatives(service.slug, service.name, service)))).flat();
+      const matches = (await mapWithConcurrency(bestMatches.slice(0, 10), DISCOVERY_CONCURRENCY, ({ service }) =>
+        aggregatorAlternatives(service.slug, service.name, service), signal)).flat();
       if (matches.length) return discoverySuggestions([...ranked(), ...matches]);
     }
     if (!alternatives.length) return rankedResult(true);
