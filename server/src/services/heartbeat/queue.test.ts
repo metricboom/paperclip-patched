@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { contextCompactionService } from "../context-compaction.js";
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { authUsers, agents, agentTaskSessions, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, routines, routineRuns } from "@paperclipai/db";
+import { authUsers, agents, agentTaskSessions, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, environments, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, routines, routineRuns } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -1633,6 +1633,153 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(cancelled, { suppressImmediateRecovery: true });
     expect(deps.treeControlSvc.getActivePauseHoldGate).not.toHaveBeenCalled();
     expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
+  it("continues to remote candidates after a host-only slot refusal", async () => {
+    // Host saturation is not agent saturation: another agent's local run fills the host cap, this
+    // agent's older local run is refused, and its newer remote-target run must still start.
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "1";
+    process.env.PAPERCLIP_HOST_ID = "host-full-test-host";
+    try {
+      const [user] = await db.insert(authUsers).values({ id: `hostfull-owner-${randomUUID()}`, name: "Owner",
+        email: `hostfull-owner-${randomUUID()}@paperclip.test`, createdAt: new Date(), updatedAt: new Date() }).returning();
+      const [company] = await db.insert(companies).values({ name: "Host full", issuePrefix: "HFUL",
+        defaultResponsibleUserId: user.id }).returning();
+      await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: user.id,
+        status: "active", membershipRole: "operator" });
+      const [otherAgent] = await db.insert(agents).values({ companyId: company.id, name: "Other agent", status: "running",
+        adapterType: "process", adapterConfig: {} }).returning();
+      await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: otherAgent.id, status: "running",
+        invocationSource: "assignment", startedAt: new Date(),
+        runnerProfileJson: { hostRun: { hostId: "host-full-test-host", limit: 1, local: true } } });
+      const [environment] = await db.insert(environments).values({ companyId: company.id, name: "SSH box",
+        driver: "ssh", config: {} }).returning();
+      const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Mixed agent", status: "idle",
+        adapterType: "process", adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, maxConcurrentRuns: 2 } } }).returning();
+      const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Untrusted task", status: "todo",
+        assigneeAgentId: agent.id }).returning();
+      await db.update(issues).set({
+        executionPolicy: { trustPreset: "low_trust_review",
+          authorizationPolicy: { trustBoundary: { mode: "low_trust_review", issueIds: [issue.id] } } },
+        executionWorkspaceSettings: { environmentId: environment.id },
+      }).where(eq(issues.id, issue.id));
+      const [local] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+        status: "queued", invocationSource: "assignment", createdAt: new Date(Date.now() - 600_000),
+        contextSnapshot: { wakeReason: "issue_assigned" } }).returning();
+      const [remote] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+        status: "queued", invocationSource: "assignment", createdAt: new Date(),
+        contextSnapshot: { issueId: issue.id, wakeReason: "issue_assigned" } }).returning();
+      const deps = callbacks(db);
+      deps.getAgent.mockResolvedValue(agent);
+      const queue = createHeartbeatQueue(db, deps);
+
+      await queue.startNextQueuedRunForAgent(agent.id);
+      const rows = new Map((await db.select().from(heartbeatRuns)).map((row) => [row.id, row]));
+      expect(rows.get(local.id)).toMatchObject({ status: "queued" });
+      expect(rows.get(remote.id)).toMatchObject({ status: "running" });
+    } finally {
+      delete process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS;
+      delete process.env.PAPERCLIP_HOST_ID;
+    }
+  });
+
+  it("starts a person-refused run's required FIFO head in the same pass and the refused run on the next sweep", async () => {
+    // Regression for the dispatch/admission deadlock (r4714738840): the per-agent dispatch sort
+    // offers the newer person-requested run first, host admission refuses it behind the older
+    // eligible head, and the pass must redirect to that head instead of abandoning the slot. The
+    // next sweep rebuilds the line and retries the refused run with no leftover backoff.
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "2";
+    try {
+      const [user] = await db.insert(authUsers).values({ id: `fifo-owner-${randomUUID()}`, name: "Owner",
+        email: `fifo-owner-${randomUUID()}@paperclip.test`, createdAt: new Date(), updatedAt: new Date() }).returning();
+      const [company] = await db.insert(companies).values({ name: "Host FIFO", issuePrefix: "HF",
+        defaultResponsibleUserId: user.id }).returning();
+      await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: user.id,
+        status: "active", membershipRole: "operator" });
+      const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Capped agent", status: "idle",
+        adapterType: "process", adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, maxConcurrentRuns: 2 } } }).returning();
+      const [older] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+        status: "queued", invocationSource: "assignment", createdAt: new Date(Date.now() - 600_000),
+        contextSnapshot: { wakeReason: "issue_assigned" } }).returning();
+      const [newer] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+        status: "queued", invocationSource: "on_demand", createdAt: new Date(),
+        contextSnapshot: { wakeReason: "task_retry" } }).returning();
+      const deps = callbacks(db);
+      deps.getAgent.mockResolvedValue(agent);
+      const queue = createHeartbeatQueue(db, deps);
+
+      await queue.startNextQueuedRunForAgent(agent.id);
+      const afterFirst = new Map((await db.select().from(heartbeatRuns)).map((row) => [row.id, row]));
+      expect(afterFirst.get(older.id)).toMatchObject({ status: "running" });
+      expect(afterFirst.get(newer.id)).toMatchObject({ status: "queued" });
+
+      await queue.resumeQueuedRunsAfterDrain();
+      const afterSecond = new Map((await db.select().from(heartbeatRuns)).map((row) => [row.id, row]));
+      expect(afterSecond.get(newer.id)).toMatchObject({ status: "running" });
+    } finally {
+      delete process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS;
+    }
+  });
+
+  it("reaches another company's host-cap waiter only through a wildcard resume pass", async () => {
+    // Regression for r4715250135: when a local run finishes, a company-scoped
+    // resume pass (the finishing company's completion wake) cannot reach a
+    // host-cap waiter queued under a different company. The host-wide wildcard
+    // pass that completion now sends does reach it.
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "1";
+    process.env.PAPERCLIP_HOST_ID = "host-wake-test-host";
+    try {
+      const [userA] = await db.insert(authUsers).values({ id: `hostwake-a-${randomUUID()}`, name: "Owner A",
+        email: `hostwake-a-${randomUUID()}@paperclip.test`, createdAt: new Date(), updatedAt: new Date() }).returning();
+      const [companyA] = await db.insert(companies).values({ name: "Host wake A", issuePrefix: "HWA",
+        defaultResponsibleUserId: userA.id }).returning();
+      await db.insert(companyMemberships).values({ companyId: companyA.id, principalType: "user", principalId: userA.id,
+        status: "active", membershipRole: "operator" });
+      const [agentA] = await db.insert(agents).values({ companyId: companyA.id, name: "Finishing agent", status: "running",
+        adapterType: "process", adapterConfig: {} }).returning();
+      const [finishing] = await db.insert(heartbeatRuns).values({ companyId: companyA.id, agentId: agentA.id, status: "running",
+        invocationSource: "assignment", startedAt: new Date(),
+        runnerProfileJson: { hostRun: { hostId: "host-wake-test-host", limit: 1, local: true } } }).returning();
+      const [userB] = await db.insert(authUsers).values({ id: `hostwake-b-${randomUUID()}`, name: "Owner B",
+        email: `hostwake-b-${randomUUID()}@paperclip.test`, createdAt: new Date(), updatedAt: new Date() }).returning();
+      const [companyB] = await db.insert(companies).values({ name: "Host wake B", issuePrefix: "HWB",
+        defaultResponsibleUserId: userB.id }).returning();
+      await db.insert(companyMemberships).values({ companyId: companyB.id, principalType: "user", principalId: userB.id,
+        status: "active", membershipRole: "operator" });
+      const [agentB] = await db.insert(agents).values({ companyId: companyB.id, name: "Waiting agent", status: "idle",
+        adapterType: "process", adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, maxConcurrentRuns: 2 } } }).returning();
+      const [waiter] = await db.insert(heartbeatRuns).values({ companyId: companyB.id, agentId: agentB.id, status: "queued",
+        invocationSource: "assignment", createdAt: new Date(),
+        contextSnapshot: { wakeReason: "issue_assigned" } }).returning();
+      const deps = callbacks(db);
+      deps.getAgent.mockImplementation(async id =>
+        id === agentA.id ? agentA : id === agentB.id ? agentB : Promise.reject(new Error("Unexpected agent lookup")));
+      const queue = createHeartbeatQueue(db, deps);
+      const waiterStatus = async () =>
+        (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, waiter.id)))[0]?.status;
+
+      // While the first company's run holds the only slot, even a wildcard pass leaves the waiter queued.
+      await queue.resumeQueuedRunsAfterDrain();
+      expect(await waiterStatus()).toBe("queued");
+
+      // Completion terminalizes the finishing run; its cleanup then sends the host-wide wake.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, finishing.id));
+
+      // A company-scoped pass for the finishing company cannot reach the waiter.
+      await queue.resumeQueuedRunsAfterDrain({ companyId: companyA.id });
+      expect(await waiterStatus()).toBe("queued");
+
+      // The host-wide wildcard pass can.
+      await queue.resumeQueuedRunsAfterDrain();
+      expect(await waiterStatus()).toBe("running");
+    } finally {
+      delete process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS;
+      delete process.env.PAPERCLIP_HOST_ID;
+    }
   });
 });
 

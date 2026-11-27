@@ -1217,6 +1217,9 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
                 else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'hostRun'
+                then jsonb_build_object('hostRun', ${heartbeatRuns.runnerProfileJson}->'hostRun')
+                else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson}#>>'{remoteWorkspace,schema}' = 'paperclip.remote-workspace-run.v1'
                 then jsonb_build_object('remoteWorkspace', ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace')
                 else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,

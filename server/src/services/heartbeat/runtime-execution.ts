@@ -38,6 +38,7 @@ import { recordLegacyWorkspaceRestoreFailure } from "../legacy-execution-recover
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { buildAgentIdentityEnv } from "@paperclipai/adapter-utils/server-utils";
+import { clearLocalRunCpuControl, configureLocalRunCpuControl, readLocalRunCpuControl, takeLocalRunCpuAccounting } from "@paperclipai/adapter-utils/local-run-cpu";
 import { externalObjectService } from "../external-objects.js";
 import { isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
 import { restoreNativeWorkspaceBestEffort } from "../native-runtime/native-workspace-best-effort.js";
@@ -896,7 +897,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchWithTiming(
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            configureLocalRunCpuControl(run.id, executionTarget?.kind === "remote" ? null : readLocalRunCpuControl(agent.runtimeConfig));
+            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", async () => {
+              try { return await adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,
               observability,
@@ -977,13 +980,26 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
               },
               authToken: authToken ?? undefined,
-            }));
+              }); } finally { clearLocalRunCpuControl(run.id); }
+            });
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
       adapterResult = await guardedDispatch.resultPromise;
     }
     adapterResult = identityRedactor.redact(adapterResult);
+    const localCpu = takeLocalRunCpuAccounting(run.id);
+    if (localCpu) {
+      adapterResult.resultJson = {
+        ...parseObject(adapterResult.resultJson),
+        localCpu,
+      };
+      if (localCpu.control.requestedQuotaPercent !== null && !localCpu.control.quotaEnforced) {
+        logger.warn({ runId: run.id, agentId: agent.id, method: localCpu.control.method,
+          fallbackReason: localCpu.control.fallbackReason },
+        "local CPU quota could not be enforced; recorded nice/no-control fallback");
+      }
+    }
     if (run.runtimeMode === "legacy" && hasWorkspaceRestoreFailure(adapterResult.resultJson)
         && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {
       const requiredWorkspaceRestoreEvidence = {

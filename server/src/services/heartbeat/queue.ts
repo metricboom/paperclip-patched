@@ -200,7 +200,7 @@ import { readContinuationAttempt } from "../recovery/index.js";
 import { AI_CONNECTION_POOL_WAIT_RETRY_REASON, allowsDependencyBlockedWake, extractWakeCommentIds, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { releaseProviderLimitWaits } from "./provider-limit-wait.js";
 import { dispatchForAgent, outsideAgentDispatch } from "../agent-start-lock.js";
-import { AgentRunSlotsFull, assertAgentRunSlotFree } from "./run-slot-admission.js";
+import { AgentRunSlotsFull, HostRunOrderingRefused, HostRunSlotsFull, assertAgentRunSlotFree, hostRunProfileFor, resolveHostRunLocality } from "./run-slot-admission.js";
 import {
   evaluateAgentInvokability,
   shouldCancelRunsForNonInvokableAgent,
@@ -1026,7 +1026,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     companyAgents?: AgentOrgRow[],
     deferredPostCommitEffects?: WakeQueuePostCommitEffect[],
     deferredCancellations?: Array<() => Promise<void>>,
-    slots?: { full: boolean },
+    slots?: { full: boolean; hostFull?: boolean; ordered?: string | null },
   ) {
     if (run.status !== "queued") return run;
     // Every start path ends here (dispatch passes, executeRun of a queued run,
@@ -1679,7 +1679,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType }, ...(await hostRunProfileFor(tx, run)) })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
@@ -1790,7 +1790,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType }, ...(await hostRunProfileFor(tx, run)) })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
@@ -1818,6 +1818,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 return { kind: "stale" as const, run: null };
               if (error instanceof AgentRunSlotsFull) {
                 if (slots) slots.full = true;
+                return { kind: "stale" as const, run: null };
+              }
+              if (error instanceof HostRunSlotsFull) {
+                if (slots) slots.hostFull = true;
+                return { kind: "stale" as const, run: null };
+              }
+              if (error instanceof HostRunOrderingRefused) {
+                if (slots) slots.ordered = error.headRunId;
                 return { kind: "stale" as const, run: null };
               }
               throw error;
@@ -1862,7 +1870,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
           const claimValues = {
             status: "running",
-            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType }, ...(await hostRunProfileFor(tx, run)) })}::jsonb`,
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
@@ -1908,6 +1916,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (error instanceof RunAdmissionClosedDuringClaim) return null;
           if (error instanceof AgentRunSlotsFull) {
             if (slots) slots.full = true;
+            return null;
+          }
+          if (error instanceof HostRunSlotsFull) {
+            if (slots) slots.hostFull = true;
+            return null;
+          }
+          if (error instanceof HostRunOrderingRefused) {
+            if (slots) slots.ordered = error.headRunId;
             return null;
           }
           throw error;
@@ -2555,6 +2571,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return Boolean(entry && queuedRunDispatchClass(entry, now) === "person" && isPersonRequestedRun(entry));
       },
       personOrigin: (run: QueuedRunCandidate) => personOriginChecked ? byRun.get(run)?.requestedByUser ?? false : undefined,
+      // Host admission names the older eligible head it requires first; attempt it next when it
+      // is one of this pass's candidates. Returns false when the head is outside this pass.
+      prioritize: (runId: string) => {
+        const candidate = runById.get(runId);
+        const entry = candidate ? byRun.get(candidate) : undefined;
+        return entry ? dispatcher.prioritize(entry.id) : false;
+      },
     };
   }
 
@@ -2651,11 +2674,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const dispatcher = await queuedRunDispatcherForAgent(agent, queuedRuns, dependencyReadiness, issueById);
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      const slots = { full: false };
+      const slots: { full: boolean; hostFull: boolean; ordered: string | null } = { full: false, hostFull: false, ordered: null };
       let claimAttempts = 0;
       const triedThisPass: string[] = [];
+      const redirectedHeads = new Set<string>();
       for (let candidate = dispatcher.next(); candidate; candidate = dispatcher.next()) {
-        if (claimedRuns.length >= availableSlots || slots.full || isRunAdmissionClosed() || signal.aborted) break;
+        if (claimedRuns.length >= availableSlots || slots.full || slots.ordered || isRunAdmissionClosed() || signal.aborted) break;
         const taskStamp = queuedRunTaskStamp(candidate, issueById);
         if (triedRunIds.has(candidate.id) || (!retryRefused && claimBackedOff(candidate.id, new Date(), taskStamp))) continue;
         if (claimAttempts >= QUEUED_RUN_CLAIM_ATTEMPTS_PER_PASS) {
@@ -2673,7 +2697,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await start.release();
           continue;
         }
+        if (slots.hostFull && await resolveHostRunLocality(db, queuedRun)) {
+          // Host saturation is not agent saturation: only local runs are blocked. Skip the
+          // remaining local candidates but keep considering remote ones, which need no host slot.
+          await start.release();
+          continue;
+        }
         let claimed: typeof heartbeatRuns.$inferSelect | null;
+        const hostFullBefore = slots.hostFull;
         try {
           claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects, deferredCancellations, slots);
         } catch (err) {
@@ -2694,6 +2725,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (!claimed) {
           await start.release();
           if (slots.full) break;
+          if (slots.hostFull && !hostFullBefore) continue; // host-only refusal: stay fresh for the next sweep and keep looking for remote candidates
+          if (slots.ordered) {
+            // Host FIFO is the authoritative start order on a capped host: an ordering refusal
+            // names the older eligible local head that must start first. Attempt that head next
+            // when it is one of this pass's candidates; when it is not, its own agent's pass
+            // claims it as its oldest, so ending this pass neither starves the head nor spins
+            // on the refused run. The refused run stays in the line and is offered again once
+            // the head has started.
+            const requiredHead = slots.ordered;
+            slots.ordered = null;
+            if (requiredHead !== candidate.id && dispatcher.prioritize(requiredHead)) {
+              redirectedHeads.add(requiredHead);
+              continue;
+            }
+            break;
+          }
+          if (redirectedHeads.has(candidate.id)) break; // a required head declined; the next pass retries it fresh
           noteDeclinedAgedClaim(candidate, "claim_declined");
           backOffClaim(candidate, dispatcher.personRun(candidate), taskStamp);
           continue;

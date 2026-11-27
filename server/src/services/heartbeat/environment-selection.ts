@@ -1,5 +1,6 @@
 import { assertProviderApiPlacementPolicy, resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { heartbeatExternalProvider, nativeExecutionUsesTaskWorkspace } from "./external-provider.js";
+import { savedAdmittedLeaseId } from "./admitted-lease.js";
 import { heartbeatRuns, issues, type Db, type agents } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { readGitCacheExpiration } from "../git-workspace-restoration.js";
@@ -26,7 +27,6 @@ import {
   nativeChatWorkspaceCwd,
   nativeChatWorkspaceMatches,
 } from "../native-runtime/native-chat-workspace.js";
-import { readNativeWorkspaceSyncReference } from "../native-runtime/native-workspace-sync.js";
 import { NativeRunnerOwnershipUnverifiedError } from "../native-runtime/native-runner-ownership.js";
 import type { environmentService } from "../environments.js";
 import type { executionWorkspaceService } from "../execution-workspaces.js";
@@ -228,9 +228,9 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
     : null;
   const savedEnvironment = parseObject(parseObject(run.contextSnapshot).paperclipEnvironment);
-  const admittedLeaseId = persistedNativeExecutionInput && !controllerOnly
-    ? readNonEmptyString(savedEnvironment.leaseId) ?? readNativeWorkspaceSyncReference(persistedRunnerProfile.nativeWorkspaceSync)?.leaseId
-    : null;
+  // Shared with claim-time admission (run-slot-admission.ts): the same persisted-native and
+  // controller-only preconditions decide whether a saved lease can drive this run's placement.
+  const admittedLeaseId = savedAdmittedLeaseId({ run, agent });
   const admittedLease = admittedLeaseId ? await environmentsSvc.getLeaseById(admittedLeaseId) : null;
   if (admittedLeaseId && (!admittedLease?.environmentId || admittedLease.companyId !== agent.companyId
     || admittedLease.heartbeatRunId !== run.id || admittedLease.issueId !== issueId || admittedLease.metadata?.agentId !== agent.id

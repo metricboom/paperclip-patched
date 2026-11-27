@@ -1,5 +1,6 @@
 import { notifyAgentRecovery, notifyCompanyRecovery, notifyIssueRecovery, notifyIssueGraphRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { heldHostRunSlot } from "./heartbeat/host-run-slot-profile.js";
 
 /** `everyTask` re-checks every task of the company; see IssueRecoveryScope. */
 export type RunDispatchScope = { companyId: string; issueId?: string | null; runId?: string | null; everyTask?: boolean };
@@ -7,6 +8,18 @@ export type RunDispatchScope = { companyId: string; issueId?: string | null; run
 export async function notifyQueuedRunDispatch(transaction: object, scope?: RunDispatchScope) {
   await notifyDeliveryWork(transaction, DELIVERY_QUEUES.queuedRunDispatch,
     scope ? JSON.stringify({ companyId: scope.companyId }) : "*");
+}
+
+/**
+ * Completion of a run that held a local host slot can admit a host-cap waiter
+ * in any company, so it wakes every company's queued-run dispatch, not only
+ * the finishing run's own. Runs without a host slot (remote, or claimed with
+ * the cap off) send nothing. Returns whether a wake was sent.
+ */
+export async function notifyHostRunSlotRelease(transaction: object, run: { runnerProfileJson: unknown }): Promise<boolean> {
+  if (!heldHostRunSlot(run)) return false;
+  await notifyQueuedRunDispatch(transaction);
+  return true;
 }
 
 export async function notifyRunDispatch(transaction: object, scope?: RunDispatchScope) {
