@@ -284,7 +284,10 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
 // itself cannot host processes once +cpu is enabled in its subtree_control (the kernel's
 // no-internal-process constraint), and the original cgroup of a member may be outside this
 // delegation or itself process-hostile. A leaf with nothing enabled in its own subtree_control
-// can host processes and carries no cpu.max, so members land outside every run quota.
+// can host processes. Effective limits there (cgroup v2 is hierarchical): the leaf's own cpu.max
+// defaults to "max 100000", so no RUN quota applies to released members; any cpu.max the
+// delegator configured on the delegated root or its ancestors still binds them, which is the
+// intended containment - released members stay inside the delegation's own budget.
 // Returns how many member moves failed (excluding ESRCH: a process that already exited needs no
 // move). Callers must surface a nonzero count: without it, a failed rollback would leave live
 // processes confined by this run's cpu.max while the run reports a nice-only fallback.
