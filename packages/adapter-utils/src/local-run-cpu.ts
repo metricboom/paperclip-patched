@@ -235,7 +235,10 @@ async function collectProcessGroupPids(pgid: number) { return (await procStats()
 export function isBenignProcWriteError(error: unknown) {
   return (error as NodeJS.ErrnoException | null)?.code === "ESRCH";
 }
-export async function containProcessGroupInCgroup(directory: string, pid: number, pgid: number | null) {
+// options.beforeResume runs after every member is moved but before a stopped group is resumed:
+// the cgroup baseline must be captured there, or CPU consumed between resume and the baseline
+// read would be subtracted from the final accounting despite being consumed inside the cgroup.
+export async function containProcessGroupInCgroup(directory: string, pid: number, pgid: number | null, options?: { beforeResume?: () => Promise<void> }) {
   const writeProc = async (member: number) => {
     try {
       await fs.writeFile(`${directory}/cgroup.procs`, `${member}\n`, { flag: "a" });
@@ -245,6 +248,7 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
   };
   if (pgid === null || pgid <= 0) {
     await writeProc(pid);
+    if (options?.beforeResume) await options.beforeResume();
     return;
   }
   const stopped = stopProcessGroup(pgid);
@@ -271,6 +275,7 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
     // The root itself is in the group it leads; this covers the rare case where the group stop
     // failed because the root already exited but other members remain.
     if (!moved.has(pid)) await writeProc(pid);
+    if (options?.beforeResume) await options.beforeResume();
   } finally {
     if (stopped) resumeProcessGroup(pgid);
   }
@@ -330,8 +335,12 @@ async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, 
     await fs.writeFile(`${parent}/cgroup.subtree_control`, "+cpu\n", { flag: "a" });
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(`${directory}/cpu.max`, `${Math.max(1, Math.floor(quotaPercent * 1_000))} 100000`);
-    await containProcessGroupInCgroup(directory, pid, pgid);
-    const start = cpuStat(await fs.readFile(`${directory}/cpu.stat`, "utf8")); if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
+    let start: ReturnType<typeof cpuStat> = null;
+    await containProcessGroupInCgroup(directory, pid, pgid, { beforeResume: async () => {
+      start = cpuStat(await fs.readFile(`${directory}/cpu.stat`, "utf8"));
+      if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
+    } });
+    if (!start) throw new Error("cgroup cpu.stat did not report usage_usec");
     return { directory, start };
   } catch (error) {
     const rollback = await releaseCgroupProcesses(directory);
@@ -366,12 +375,14 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
   // being matched.
   // Round the window start up so fractional-tick truncation cannot classify a just-pre-window
   // process as born in-window.
-  const uptimeTicks = await kernelUptimeTicks();
+  const uptimeTicks = !cgroup ? await kernelUptimeTicks() : null;
   const windowStartTicks = uptimeTicks === null ? null : Math.ceil(uptimeTicks);
   let preWindowEntrants = 0;
   const collectRows = processGroupId ? () => processGroupRows(processGroupId) : () => processTreeRows(pid);
   const highWater = new Map<string, HighWaterEntry>();
-  const samplingSupported = process.platform === "linux";
+  // The /proc sampler is the fallback backend: it enumerates every host pid four times per
+  // second, so it runs only when cgroup accounting is unavailable and the platform supports it.
+  const samplingSupported = process.platform === "linux" && !cgroup;
   if (samplingSupported) foldProcRowsIntoHighWater(highWater, await collectRows(), true, windowStartTicks);
   const sampler = samplingSupported ? setInterval(() => { void collectRows().then(rows => { preWindowEntrants += foldProcRowsIntoHighWater(highWater, rows, false, windowStartTicks); }); }, 250) : null;
   if (sampler) sampler.unref();

@@ -259,6 +259,35 @@ describe("local run CPU controls", () => {
     expect(finalizeCpuSeconds({ user: 100, system: 50 })).toEqual({ userCpuSeconds: 1, systemCpuSeconds: 0.5, cpuSeconds: 1.5 });
   });
 
+  it("captures the cgroup baseline while the process group is still stopped", async () => {
+    if (process.platform !== "linux") return;
+    const { spawn } = await import("node:child_process");
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cpu-cgroup-base-"));
+    const directory = path.join(root, "paperclip-runs", "cpu-base");
+    await fs.mkdir(directory, { recursive: true });
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "ignore", detached: true });
+    try {
+      await new Promise((resolve) => child.on("spawn", resolve));
+      let stateDuringHook: string | undefined;
+      await containProcessGroupInCgroup(directory, child.pid!, child.pid!, { beforeResume: async () => {
+        const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8");
+        stateDuringHook = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[0];
+      } });
+      // The baseline hook must observe the group still stopped: any CPU it burns after resume
+      // belongs to the window, not to the baseline subtracted at finish.
+      expect(stateDuringHook).toBe("T");
+      const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8");
+      expect(stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[0]).not.toBe("T");
+    } finally {
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { /* gone */ }
+      child.kill("SIGKILL");
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {
     vi.useFakeTimers();
     try {
