@@ -415,3 +415,44 @@ describe("deep per-agent queue: a recovery burst behind 20 busy slots (paperclip
     expect(started[0]!.wakeReason).toBe("issue_assigned");
   });
 });
+
+describe("host FIFO head prioritization", () => {
+  it("offers a required older head next after an ordering refusal", () => {
+    const older = run({ wakeReason: "issue_assigned", createdAt: minutesAgo(30) });
+    const person = personRetry(1);
+    const dispatcher = createQueuedRunDispatcher([older, person], { now, startsSinceRecovery: 0 });
+    // The per-agent dispatch order offers the person-requested run first.
+    expect(dispatcher.next()?.id).toBe(person.id);
+    // Host admission refuses it behind the older eligible head; the pass attempts that head next.
+    expect(dispatcher.prioritize(older.id)).toBe(true);
+    expect(dispatcher.next()?.id).toBe(older.id);
+    dispatcher.claimed(older);
+    // The refused run is not re-offered in this pass; the next pass's rebuilt line retries it,
+    // so it waits behind the started head instead of deadlocking the pass.
+    expect(dispatcher.next()).toBeNull();
+  });
+
+  it("reports false for a required head outside this pass and leaves the line untouched", () => {
+    const older = run({ wakeReason: "issue_assigned", createdAt: minutesAgo(30) });
+    const person = personRetry(1);
+    const dispatcher = createQueuedRunDispatcher([older, person], { now, startsSinceRecovery: 0 });
+    expect(dispatcher.prioritize("run-from-another-agent")).toBe(false);
+    expect(dispatcher.next()?.id).toBe(person.id);
+  });
+
+  it("re-prioritizes toward strictly older heads without losing the line", () => {
+    const oldest = run({ wakeReason: "issue_assigned", createdAt: minutesAgo(60) });
+    const middle = run({ wakeReason: "issue_assigned", createdAt: minutesAgo(30) });
+    const person = personRetry(1);
+    const dispatcher = createQueuedRunDispatcher([oldest, middle, person], { now, startsSinceRecovery: 0 });
+    expect(dispatcher.next()?.id).toBe(person.id);
+    // A refusal behind the middle head, then the middle's own refusal behind the oldest:
+    // each redirect moves strictly older, so the pass converges instead of spinning.
+    expect(dispatcher.prioritize(middle.id)).toBe(true);
+    expect(dispatcher.next()?.id).toBe(middle.id);
+    expect(dispatcher.prioritize(oldest.id)).toBe(true);
+    expect(dispatcher.next()?.id).toBe(oldest.id);
+    dispatcher.claimed(oldest);
+    expect(dispatcher.next()).toBeNull();
+  });
+});

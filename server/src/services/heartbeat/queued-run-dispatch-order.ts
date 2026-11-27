@@ -217,6 +217,15 @@ export function createQueuedRunDispatcher<T extends QueuedRunDispatchFacts>(
       sinceOldest = !oldest || servesOldestShare({ createdAt: run.createdAt, personWaiting: isPersonWaitingRun(run, input.now) },
         oldest, input.now) ? 0 : sinceOldest + 1;
     },
+    // Host admission can require an older eligible run to start first (host FIFO). Move that
+    // required head to the front of the remaining line so the pass attempts it next, without
+    // changing the share accounting the next() choices are made with.
+    prioritize(runId: string): boolean {
+      const index = remaining.findIndex(run => run.id === runId);
+      if (index < 0) return false;
+      if (index > 0) remaining.unshift(...remaining.splice(index, 1));
+      return true;
+    },
   };
 }
 

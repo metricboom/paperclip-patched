@@ -1821,7 +1821,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 return { kind: "stale" as const, run: null };
               }
               if (error instanceof HostRunOrderingRefused) {
-                if (slots) slots.ordered = true;
+                if (slots) slots.ordered = error.headRunId;
                 return { kind: "stale" as const, run: null };
               }
               throw error;
@@ -1915,7 +1915,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return null;
           }
           if (error instanceof HostRunOrderingRefused) {
-            if (slots) slots.ordered = true;
+            if (slots) slots.ordered = error.headRunId;
             return null;
           }
           throw error;
@@ -2563,6 +2563,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return Boolean(entry && queuedRunDispatchClass(entry, now) === "person" && isPersonRequestedRun(entry));
       },
       personOrigin: (run: QueuedRunCandidate) => personOriginChecked ? byRun.get(run)?.requestedByUser ?? false : undefined,
+      // Host admission names the older eligible head it requires first; attempt it next when it
+      // is one of this pass's candidates. Returns false when the head is outside this pass.
+      prioritize: (runId: string) => {
+        const candidate = runById.get(runId);
+        const entry = candidate ? byRun.get(candidate) : undefined;
+        return entry ? dispatcher.prioritize(entry.id) : false;
+      },
     };
   }
 
@@ -2659,9 +2666,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const dispatcher = await queuedRunDispatcherForAgent(agent, queuedRuns, dependencyReadiness, issueById);
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      const slots: { full: boolean; ordered: boolean } = { full: false, ordered: false };
+      const slots: { full: boolean; ordered: string | null } = { full: false, ordered: null };
       let claimAttempts = 0;
       const triedThisPass: string[] = [];
+      const redirectedHeads = new Set<string>();
       for (let candidate = dispatcher.next(); candidate; candidate = dispatcher.next()) {
         if (claimedRuns.length >= availableSlots || slots.full || slots.ordered || isRunAdmissionClosed() || signal.aborted) break;
         const taskStamp = queuedRunTaskStamp(candidate, issueById);
@@ -2701,7 +2709,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
         if (!claimed) {
           await start.release();
-          if (slots.full || slots.ordered) break;
+          if (slots.full) break;
+          if (slots.ordered) {
+            // Host FIFO is the authoritative start order on a capped host: an ordering refusal
+            // names the older eligible local head that must start first. Attempt that head next
+            // when it is one of this pass's candidates; when it is not, its own agent's pass
+            // claims it as its oldest, so ending this pass neither starves the head nor spins
+            // on the refused run. The refused run stays in the line and is offered again once
+            // the head has started.
+            const requiredHead = slots.ordered;
+            slots.ordered = null;
+            if (requiredHead !== candidate.id && dispatcher.prioritize(requiredHead)) {
+              redirectedHeads.add(requiredHead);
+              continue;
+            }
+            break;
+          }
+          if (redirectedHeads.has(candidate.id)) break; // a required head declined; the next pass retries it fresh
           noteDeclinedAgedClaim(candidate, "claim_declined");
           backOffClaim(candidate, dispatcher.personRun(candidate), taskStamp);
           continue;
