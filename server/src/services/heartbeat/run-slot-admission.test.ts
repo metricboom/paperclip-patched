@@ -78,6 +78,30 @@ describe("claim-time host locality", () => {
     expect(await resolveHostRunLocality(tx, run)).toBe(false);
   });
 
+  // Regression for r4715321060: admission must classify with the effective
+  // (read-time overlaid) settings execution uses, not the raw stored row.
+  it("keeps a run local when the managed overlay disables a stored managed-sandbox-only flag", async () => {
+    process.env.PAPERCLIP_MANAGED_CONFIG = JSON.stringify({ v: 1, mode: "cloud", catalogVersion: "2026.720.0",
+      features: { enableManagedSandboxOnly: false }, plugins: { autoInstall: [] }, environments: [] });
+    try {
+      const { tx } = fakeTx([agent("e1"), settings({ experimental: { enableManagedSandboxOnly: true } }), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, run)).toBe(true);
+    } finally {
+      delete process.env.PAPERCLIP_MANAGED_CONFIG;
+    }
+  });
+
+  it("classes a local result as not local when the managed overlay enables managed-sandbox-only", async () => {
+    process.env.PAPERCLIP_MANAGED_CONFIG = JSON.stringify({ v: 1, mode: "cloud", catalogVersion: "2026.720.0",
+      features: { enableManagedSandboxOnly: true }, plugins: { autoInstall: [] }, environments: [] });
+    try {
+      const { tx } = fakeTx([agent("e1"), settings(), [{ driver: "local" }]]);
+      expect(await resolveHostRunLocality(tx, run)).toBe(false);
+    } finally {
+      delete process.env.PAPERCLIP_MANAGED_CONFIG;
+    }
+  });
+
   it("classes every run as not local when execution is forced to Kubernetes", async () => {
     const { tx, selects } = fakeTx([agent("e1"), settings({ general: { executionMode: "kubernetes" } })]);
     expect(await resolveHostRunLocality(tx, run)).toBe(false);

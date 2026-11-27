@@ -66,7 +66,7 @@ const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip
 const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSchema.strip();
 const TRUTHY_RUNTIME_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
-interface InstanceSettingsServiceOptions {
+export interface InstanceSettingsServiceOptions {
   runtimeEnv?: Record<string, string | undefined>;
   now?: () => Date;
 }
@@ -491,11 +491,9 @@ export function stripCloudCatalogDefaultEchoes(
   return result as Partial<InstanceExperimentalSettings>;
 }
 
-export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {
-  // Fail closed: a malformed PAPERCLIP_MANAGED_CONFIG throws here (and at
-  // boot in index.ts) rather than silently running without the overlay.
-  const managedConfig = getManagedInstanceConfig(options.runtimeEnv ?? process.env);
-  const staging = isCloudStagingInstance(options.runtimeEnv ?? process.env);
+function resolveManagedOverlayContext(runtimeEnv: Record<string, string | undefined>) {
+  const managedConfig = getManagedInstanceConfig(runtimeEnv);
+  const staging = isCloudStagingInstance(runtimeEnv);
   const enforcedManagedConfig = staging && managedConfig
     ? {
       ...managedConfig,
@@ -503,6 +501,46 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         .filter(([key, enabled]) => enabled || !isCloudStagingExperimentalSetting(key))),
     }
     : managedConfig;
+  return { managedConfig, staging, enforcedManagedConfig };
+}
+
+function experimentalView(
+  raw: unknown,
+  ctx: ReturnType<typeof resolveManagedOverlayContext>,
+  syncTrialInference: boolean,
+): InstanceExperimentalSettingsWithManaged {
+  const stored = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const defaults = ctx.staging ? { ...ctx.managedConfig?.features, ...stored } : raw;
+  const { experimental, managedKeys } = applyManagedExperimentalOverlay(
+    applyCloudCatalogDefaults(normalizeExperimentalSettings(defaults), defaults, ctx.managedConfig),
+    ctx.enforcedManagedConfig,
+  );
+  if (syncTrialInference) {
+    setResolvedCloudTrialInferenceEnabled(experimental.enableCloudTrialInference === true);
+  }
+  // Self-hosted responses stay byte-identical: no managedKeys field at all.
+  return ctx.managedConfig ? { ...experimental, managedKeys } : experimental;
+}
+
+/**
+ * Effective views over a raw stored settings row for read-only callers that
+ * cannot use the service (e.g. claim-time host admission inside a
+ * transaction). Same read-time overlay contract as getGeneral/getExperimental,
+ * so policy consumers and execution share one effective value. Fail closed:
+ * a malformed PAPERCLIP_MANAGED_CONFIG throws here as at service construction.
+ */
+export function effectiveInstanceGeneralView(raw: unknown, options: InstanceSettingsServiceOptions = {}): InstanceGeneralSettings {
+  return applyOperatorGeneralDefaults(normalizeGeneralSettings(raw), getOperatorSettingDefaults(options.runtimeEnv ?? process.env));
+}
+
+export function effectiveInstanceExperimentalView(raw: unknown, options: InstanceSettingsServiceOptions = {}): InstanceExperimentalSettingsWithManaged {
+  return experimentalView(raw, resolveManagedOverlayContext(options.runtimeEnv ?? process.env), !options.runtimeEnv);
+}
+
+export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {
+  // Fail closed: a malformed PAPERCLIP_MANAGED_CONFIG throws here (and at
+  // boot in index.ts) rather than silently running without the overlay.
+  const { managedConfig, staging, enforcedManagedConfig } = resolveManagedOverlayContext(options.runtimeEnv ?? process.env);
   // Same posture for PAPERCLIP_SETTING_DEFAULTS: parsed once, applied per
   // read, never persisted (see applyOperatorGeneralDefaults) — including on
   // the write path, where a full-GET echo of the overlaid value is stripped
@@ -514,17 +552,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   }
 
   function toExperimentalView(raw: unknown): InstanceExperimentalSettingsWithManaged {
-    const stored = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-    const defaults = staging ? { ...managedConfig?.features, ...stored } : raw;
-    const { experimental, managedKeys } = applyManagedExperimentalOverlay(
-      applyCloudCatalogDefaults(normalizeExperimentalSettings(defaults), defaults, managedConfig),
-      enforcedManagedConfig,
-    );
-    if (!options.runtimeEnv) {
-      setResolvedCloudTrialInferenceEnabled(experimental.enableCloudTrialInference === true);
-    }
-    // Self-hosted responses stay byte-identical: no managedKeys field at all.
-    return managedConfig ? { ...experimental, managedKeys } : experimental;
+    return experimentalView(raw, { managedConfig, staging, enforcedManagedConfig }, !options.runtimeEnv);
   }
 
   function toInstanceSettings(row: typeof instanceSettings.$inferSelect): InstanceSettings {

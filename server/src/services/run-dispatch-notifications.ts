@@ -1,6 +1,6 @@
 import { notifyAgentRecovery, notifyCompanyRecovery, notifyIssueRecovery, notifyIssueGraphRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { heldHostRunSlot } from "./heartbeat/run-slot-admission.js";
+import { heldHostRunSlot } from "./heartbeat/host-run-slot-profile.js";
 
 /** `everyTask` re-checks every task of the company; see IssueRecoveryScope. */
 export type RunDispatchScope = { companyId: string; issueId?: string | null; runId?: string | null; everyTask?: boolean };

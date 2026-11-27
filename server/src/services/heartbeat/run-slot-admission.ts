@@ -6,6 +6,7 @@ import { maxConcurrentRunsSql } from "./timer-policy.js";
 import { logger } from "../../middleware/logger.js";
 import { parseObject } from "../../adapters/utils.js";
 import { isExecutionForcedToKubernetes } from "../execution-allowlist.js";
+import { effectiveInstanceExperimentalView, effectiveInstanceGeneralView } from "../instance-settings.js";
 import { parseIssueExecutionWorkspaceSettings } from "../execution-workspace-policy.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 
@@ -68,7 +69,10 @@ export async function resolveHostRunLocality(tx: Pick<Db, "select">, run: Claimi
     if (!agent) return unresolved("agent_not_found");
     const [settings] = await tx.select({ defaultEnvironmentId: instanceSettings.defaultEnvironmentId, general: instanceSettings.general, experimental: instanceSettings.experimental })
       .from(instanceSettings).where(eq(instanceSettings.singletonKey, "default")).limit(1);
-    const executionMode = parseObject(settings?.general).executionMode;
+    // Effective views (read-time overlays applied), matching what execution
+    // resolves through the settings service, so admission and execution share
+    // one policy value.
+    const executionMode = effectiveInstanceGeneralView(settings?.general).executionMode;
     if (isExecutionForcedToKubernetes({ executionMode: executionMode === "kubernetes" ? "kubernetes" : "any" })) return false;
 
     // Controller-side placements resolve no environment in the executor, so they are never local.
@@ -123,7 +127,7 @@ export async function resolveHostRunLocality(tx: Pick<Db, "select">, run: Claimi
       driver = environment.driver;
     }
     const isLocal = driver === null || driver === "local";
-    if (isLocal && parseObject(settings?.experimental).enableManagedSandboxOnly === true) return false;
+    if (isLocal && effectiveInstanceExperimentalView(settings?.experimental).enableManagedSandboxOnly === true) return false;
     return isLocal;
   } catch (error) {
     return unresolved("resolution_failed", { error: error instanceof Error ? error.message : String(error) });
@@ -136,16 +140,7 @@ export async function hostRunProfileFor(tx: Pick<Db, "select">, run: ClaimingRun
   return limit === null ? {} : { hostRun: { hostId: configuredHostRunId(), limit, local: await resolveHostRunLocality(tx, run) } };
 }
 
-/**
- * True when the run held a slot under the host cap: the claim recorded
- * hostRun metadata (written only when a cap applies) and was not classified
- * remote. Matches the admission counting predicate, where a missing `local`
- * classification counts as local.
- */
-export function heldHostRunSlot(run: { runnerProfileJson: unknown }): boolean {
-  const hostRun = parseObject(parseObject(run.runnerProfileJson).hostRun);
-  return Object.keys(hostRun).length > 0 && hostRun.local !== false;
-}
+export { heldHostRunSlot } from "./host-run-slot-profile.js";
 
 type ClaimingRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "retryOfRunId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson" | "driverKind">;
 
