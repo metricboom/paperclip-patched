@@ -67,9 +67,15 @@ export async function resolveHostRunLocality(tx: Pick<Db, "select">, run: Claimi
     let environmentId: string | null = null;
     const leaseId = parseObject(context.paperclipEnvironment).leaseId;
     if (typeof leaseId === "string" && isUuidLike(leaseId)) {
-      const [lease] = await tx.select({ environmentId: environmentLeases.environmentId }).from(environmentLeases)
+      const [lease] = await tx.select({ environmentId: environmentLeases.environmentId, heartbeatRunId: environmentLeases.heartbeatRunId,
+        issueId: environmentLeases.issueId, metadata: environmentLeases.metadata }).from(environmentLeases)
         .where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, run.companyId))).limit(1);
-      environmentId = lease?.environmentId ?? null;
+      // Same binding the executor checks (environment-selection.ts): a retry that merely inherits a
+      // predecessor's lease id must not decide where this run executes.
+      const contextIssueId = typeof context.issueId === "string" ? context.issueId : null;
+      const bound = lease && lease.heartbeatRunId === run.id && (lease.issueId ?? null) === contextIssueId
+        && parseObject(lease.metadata).agentId === run.agentId;
+      environmentId = bound ? lease.environmentId ?? null : null;
     }
     if (!environmentId) {
       const issueId = context.issueId;

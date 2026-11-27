@@ -62,10 +62,24 @@ describe("claim-time host locality", () => {
     expect(selects()).toBe(2);
   });
 
-  it("prefers the environment of an already admitted lease over the agent default", async () => {
-    const withLease = { ...(run as object), contextSnapshot: { paperclipEnvironment: { leaseId: randomUUID() } } } as never;
-    const { tx } = fakeTx([agent("e1"), settings(), [{ environmentId: "e9" }], [{ driver: "sandbox" }]]);
-    expect(await resolveHostRunLocality(tx, withLease)).toBe(false);
+  const leased = () => ({ ...(run as object), contextSnapshot: { paperclipEnvironment: { leaseId: randomUUID() } } } as never);
+  const leaseRow = (over: Record<string, unknown> = {}) => [{ environmentId: "e9", heartbeatRunId: "run-2", issueId: null, metadata: { agentId: "a" }, ...over }];
+
+  it("prefers the environment of a lease bound to this run over the agent default", async () => {
+    const { tx } = fakeTx([agent("e1"), settings(), leaseRow(), [{ driver: "sandbox" }]]);
+    expect(await resolveHostRunLocality(tx, leased())).toBe(false);
+  });
+
+  it("ignores a lease inherited from a predecessor run, so a retry resolves its current target", async () => {
+    const { tx } = fakeTx([agent("e1"), settings(), leaseRow({ heartbeatRunId: "run-1" }), [{ driver: "local" }]]);
+    expect(await resolveHostRunLocality(tx, leased())).toBe(true);
+  });
+
+  it("ignores a lease bound to another agent or issue", async () => {
+    const other = fakeTx([agent("e1"), settings(), leaseRow({ metadata: { agentId: "other" } }), [{ driver: "local" }]]);
+    expect(await resolveHostRunLocality(other.tx, leased())).toBe(true);
+    const issue = fakeTx([agent("e1"), settings(), leaseRow({ issueId: randomUUID() }), [{ driver: "local" }]]);
+    expect(await resolveHostRunLocality(issue.tx, leased())).toBe(true);
   });
 
   it("counts a run as local and logs when its environment row cannot be found", async () => {
