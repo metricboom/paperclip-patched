@@ -283,8 +283,18 @@ async function releaseCgroupProcesses(directory: string) {
 }
 async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, quotaPercent: number) {
   if (process.platform !== "linux") throw new Error("cgroup v2 is only available on Linux");
-  const directory = `${process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup"}/paperclip-runs/${runId}`;
+  const root = process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup";
+  const parent = `${root}/paperclip-runs`;
+  const directory = `${parent}/${runId}`;
   try {
+    await fs.mkdir(parent, { recursive: true });
+    // cgroup v2: a child exposes cpu.max only when +cpu is enabled in its parent's
+    // subtree_control, and creating directories does not enable it. Enable at both ancestors
+    // (append: each write is an add-command on cgroupfs and must not clear other controllers).
+    // A failure here means this host cannot enforce the quota in a fresh subtree, so it
+    // propagates into the honest nice fallback below.
+    await fs.writeFile(`${root}/cgroup.subtree_control`, "+cpu\n", { flag: "a" });
+    await fs.writeFile(`${parent}/cgroup.subtree_control`, "+cpu\n", { flag: "a" });
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(`${directory}/cpu.max`, `${Math.max(1, Math.floor(quotaPercent * 1_000))} 100000`);
     await containProcessGroupInCgroup(directory, pid, pgid);
