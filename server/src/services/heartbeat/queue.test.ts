@@ -1722,6 +1722,65 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
       delete process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS;
     }
   });
+
+  it("reaches another company's host-cap waiter only through a wildcard resume pass", async () => {
+    // Regression for r4715250135: when a local run finishes, a company-scoped
+    // resume pass (the finishing company's completion wake) cannot reach a
+    // host-cap waiter queued under a different company. The host-wide wildcard
+    // pass that completion now sends does reach it.
+    process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS = "1";
+    process.env.PAPERCLIP_HOST_ID = "host-wake-test-host";
+    try {
+      const [userA] = await db.insert(authUsers).values({ id: `hostwake-a-${randomUUID()}`, name: "Owner A",
+        email: `hostwake-a-${randomUUID()}@paperclip.test`, createdAt: new Date(), updatedAt: new Date() }).returning();
+      const [companyA] = await db.insert(companies).values({ name: "Host wake A", issuePrefix: "HWA",
+        defaultResponsibleUserId: userA.id }).returning();
+      await db.insert(companyMemberships).values({ companyId: companyA.id, principalType: "user", principalId: userA.id,
+        status: "active", membershipRole: "operator" });
+      const [agentA] = await db.insert(agents).values({ companyId: companyA.id, name: "Finishing agent", status: "running",
+        adapterType: "process", adapterConfig: {} }).returning();
+      const [finishing] = await db.insert(heartbeatRuns).values({ companyId: companyA.id, agentId: agentA.id, status: "running",
+        invocationSource: "assignment", startedAt: new Date(),
+        runnerProfileJson: { hostRun: { hostId: "host-wake-test-host", limit: 1, local: true } } }).returning();
+      const [userB] = await db.insert(authUsers).values({ id: `hostwake-b-${randomUUID()}`, name: "Owner B",
+        email: `hostwake-b-${randomUUID()}@paperclip.test`, createdAt: new Date(), updatedAt: new Date() }).returning();
+      const [companyB] = await db.insert(companies).values({ name: "Host wake B", issuePrefix: "HWB",
+        defaultResponsibleUserId: userB.id }).returning();
+      await db.insert(companyMemberships).values({ companyId: companyB.id, principalType: "user", principalId: userB.id,
+        status: "active", membershipRole: "operator" });
+      const [agentB] = await db.insert(agents).values({ companyId: companyB.id, name: "Waiting agent", status: "idle",
+        adapterType: "process", adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, maxConcurrentRuns: 2 } } }).returning();
+      const [waiter] = await db.insert(heartbeatRuns).values({ companyId: companyB.id, agentId: agentB.id, status: "queued",
+        invocationSource: "assignment", createdAt: new Date(),
+        contextSnapshot: { wakeReason: "issue_assigned" } }).returning();
+      const deps = callbacks(db);
+      deps.getAgent.mockImplementation(async id =>
+        id === agentA.id ? agentA : id === agentB.id ? agentB : Promise.reject(new Error("Unexpected agent lookup")));
+      const queue = createHeartbeatQueue(db, deps);
+      const waiterStatus = async () =>
+        (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, waiter.id)))[0]?.status;
+
+      // While the first company's run holds the only slot, even a wildcard pass leaves the waiter queued.
+      await queue.resumeQueuedRunsAfterDrain();
+      expect(await waiterStatus()).toBe("queued");
+
+      // Completion terminalizes the finishing run; its cleanup then sends the host-wide wake.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, finishing.id));
+
+      // A company-scoped pass for the finishing company cannot reach the waiter.
+      await queue.resumeQueuedRunsAfterDrain({ companyId: companyA.id });
+      expect(await waiterStatus()).toBe("queued");
+
+      // The host-wide wildcard pass can.
+      await queue.resumeQueuedRunsAfterDrain();
+      expect(await waiterStatus()).toBe("running");
+    } finally {
+      delete process.env.PAPERCLIP_HOST_MAX_CONCURRENT_RUNS;
+      delete process.env.PAPERCLIP_HOST_ID;
+    }
+  });
 });
 
 describe("a /swarm request survives wake coalescing", () => {
