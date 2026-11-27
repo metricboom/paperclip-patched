@@ -136,6 +136,17 @@ export async function hostRunProfileFor(tx: Pick<Db, "select">, run: ClaimingRun
   return limit === null ? {} : { hostRun: { hostId: configuredHostRunId(), limit, local: await resolveHostRunLocality(tx, run) } };
 }
 
+/**
+ * True when the run held a slot under the host cap: the claim recorded
+ * hostRun metadata (written only when a cap applies) and was not classified
+ * remote. Matches the admission counting predicate, where a missing `local`
+ * classification counts as local.
+ */
+export function heldHostRunSlot(run: { runnerProfileJson: unknown }): boolean {
+  const hostRun = parseObject(parseObject(run.runnerProfileJson).hostRun);
+  return Object.keys(hostRun).length > 0 && hostRun.local !== false;
+}
+
 type ClaimingRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "retryOfRunId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson" | "driverKind">;
 
 function replacedRunIds(run: ClaimingRun): string[] {

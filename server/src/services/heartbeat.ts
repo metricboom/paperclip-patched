@@ -118,6 +118,8 @@ import {
   notifyOtherAgentsQueuedOnSettledIssue,
   unsavedWakeAdmissionCount,
 } from "./heartbeat/queue.js";
+import { heldHostRunSlot } from "./heartbeat/run-slot-admission.js";
+import { notifyQueuedRunDispatch } from "./run-dispatch-notifications.js";
 export {
   shouldDeferFollowupWakeForSameIssue,
   shouldQueueFollowupForRunningIssueWake,
@@ -4482,6 +4484,13 @@ export function heartbeatService(
         }
         await startNextQueuedRunForAgent(run.agentId);
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+          // A released host slot can admit a host-cap waiter in any company;
+          // company-scoped wakes would leave it on the redrive backoff.
+          if (heldHostRunSlot(latestRun)) {
+            await notifyQueuedRunDispatch(db).catch(err => {
+              logger.warn({ err, runId: run.id }, "failed to wake host-cap waiters after execution cleanup");
+            });
+          }
           await notifyOtherAgentsQueuedOnSettledIssue(db, latestRun).catch(err => {
             logger.warn({ err, runId: run.id }, "failed to wake the task's next owner after execution cleanup");
           });

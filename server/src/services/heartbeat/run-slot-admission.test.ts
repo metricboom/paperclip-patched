@@ -26,7 +26,7 @@ vi.mock("../native-runtime/native-workspace-sync.js", () => ({
   },
 }));
 
-import { assertAgentRunSlotFree, HostRunOrderingRefused, HostRunSlotsFull, hostRunProfileFor, resolveHostRunLocality } from "./run-slot-admission.js";
+import { assertAgentRunSlotFree, HostRunOrderingRefused, HostRunSlotsFull, heldHostRunSlot, hostRunProfileFor, resolveHostRunLocality } from "./run-slot-admission.js";
 
 /** Each select() resolves with the next queued rows, whatever builder methods are chained on it. */
 function fakeTx(results: unknown[][]) {
@@ -269,5 +269,24 @@ describe("host run admission", () => {
     const { tx, selects } = fakeTx([[{ count: 0 }], [{ limit: 5 }]]);
     await expect(assertAgentRunSlotFree(tx, run)).resolves.toBeUndefined();
     expect(selects()).toBe(2);
+  });
+});
+
+describe("heldHostRunSlot", () => {
+  it("is true for a run claimed local under the host cap", () => {
+    expect(heldHostRunSlot({ runnerProfileJson: { hostRun: { hostId: "h1", limit: 2, local: true } } })).toBe(true);
+  });
+
+  it("is true when the claim recorded no locality classification", () => {
+    expect(heldHostRunSlot({ runnerProfileJson: { hostRun: { hostId: "h1", limit: 2 } } })).toBe(true);
+  });
+
+  it("is false for a run claimed remote", () => {
+    expect(heldHostRunSlot({ runnerProfileJson: { hostRun: { hostId: "h1", limit: 2, local: false } } })).toBe(false);
+  });
+
+  it("is false when the cap was off and no hostRun metadata was recorded", () => {
+    expect(heldHostRunSlot({ runnerProfileJson: { adapterDispatch: { adapterType: "process" } } })).toBe(false);
+    expect(heldHostRunSlot({ runnerProfileJson: null })).toBe(false);
   });
 });
