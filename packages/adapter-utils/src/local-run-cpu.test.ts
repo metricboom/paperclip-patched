@@ -238,6 +238,20 @@ describe("local run CPU controls", () => {
     }
   });
 
+  it("never configures cgroups outside an explicitly delegated subtree", async () => {
+    if (process.platform !== "linux") return;
+    // Without PAPERCLIP_CGROUP_ROOT the fallback default would be the host root cgroup; setup
+    // must refuse rather than enable controllers or write quotas against host-wide settings.
+    delete process.env.PAPERCLIP_CGROUP_ROOT;
+    configureLocalRunCpuControl("cpu-nodelegation", { nice: 10, quotaPercent: 50 });
+    const finish = await beginLocalRunCpuAccounting("cpu-nodelegation", process.pid, null);
+    const accounting = await finish();
+    expect(accounting.control.quotaEnforced).toBe(false);
+    expect(accounting.quality).toBe("approximate_proc_group");
+    expect(accounting.control.fallbackReason).toContain("PAPERCLIP_CGROUP_ROOT");
+    clearLocalRunCpuControl("cpu-nodelegation");
+  });
+
   it("keeps a live run's accounting across long multi-child spans and sweeps only unwound owners", async () => {
     vi.useFakeTimers();
     try {

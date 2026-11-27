@@ -11,6 +11,11 @@ export interface LocalRunCpuAccounting {
   // the window (e.g. reparented into the tree). Their pre-first-observation CPU is unknown and is
   // excluded from the totals; it is flagged here instead of being reported as measured run CPU.
   unmeasuredPriorCpuProcesses?: number;
+  // Set when finish-time cgroup cleanup could not fully release the run's cgroup: names the run
+  // and directory and whether member processes may remain confined by its cpu.max. A completed
+  // parent process does not prove descendants exited, so cleanup failure is recorded here rather
+  // than assumed clean.
+  cleanupWarning?: string;
 }
 const controls = new Map<string, LocalRunCpuControl>();
 // Runs dispatched through the heartbeat runtime register here: configureLocalRunCpuControl is
@@ -70,9 +75,11 @@ export function mergeLocalRunCpuAccounting(previous: LocalRunCpuAccounting | nul
     .flatMap(reason => reason ? reason.split("; ") : []))];
   const appliedNice = previous.control.appliedNice ?? next.control.appliedNice;
   const unmeasuredPriorCpuProcesses = (previous.unmeasuredPriorCpuProcesses ?? 0) + (next.unmeasuredPriorCpuProcesses ?? 0);
+  const cleanupWarning = [...new Set([previous.cleanupWarning, next.cleanupWarning].filter((warning): warning is string => Boolean(warning)))].join("; ");
   return {
     schema: next.schema, scope: next.scope,
     ...(unmeasuredPriorCpuProcesses ? { unmeasuredPriorCpuProcesses } : {}),
+    ...(cleanupWarning ? { cleanupWarning } : {}),
     quality: previous.quality === "exact_cgroup_v2" && next.quality === "exact_cgroup_v2" ? "exact_cgroup_v2" : "approximate_proc_group",
     userCpuSeconds: addNullable(previous.userCpuSeconds, next.userCpuSeconds),
     systemCpuSeconds: addNullable(previous.systemCpuSeconds, next.systemCpuSeconds),
@@ -268,11 +275,13 @@ export async function containProcessGroupInCgroup(directory: string, pid: number
 // processes confined by this run's cpu.max while the run reports a nice-only fallback.
 async function releaseCgroupProcesses(directory: string) {
   const procs = await fs.readFile(`${directory}/cgroup.procs`, "utf8").catch(() => "");
-  const root = process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup";
+  const root = process.env.PAPERCLIP_CGROUP_ROOT;
+  const members = procs.split("\n").map(line => line.trim()).filter(Boolean);
+  // Without a delegated subtree there is no permitted move-back target; every surviving member
+  // counts as failed so the caller surfaces it.
+  if (!root) return { failed: members.length };
   let failed = 0;
-  for (const line of procs.split("\n")) {
-    const member = line.trim();
-    if (!member) continue;
+  for (const member of members) {
     try {
       await fs.writeFile(`${root}/cgroup.procs`, `${member}\n`, { flag: "a" });
     } catch (error) {
@@ -283,7 +292,11 @@ async function releaseCgroupProcesses(directory: string) {
 }
 async function tryCreateCgroup(runId: string, pid: number, pgid: number | null, quotaPercent: number) {
   if (process.platform !== "linux") throw new Error("cgroup v2 is only available on Linux");
-  const root = process.env.PAPERCLIP_CGROUP_ROOT || "/sys/fs/cgroup";
+  // Only operate inside an explicitly delegated writable subtree. Without PAPERCLIP_CGROUP_ROOT
+  // the default would be the host root cgroup, and enabling controllers there would alter
+  // host-wide settings this process has no delegation for.
+  if (!process.env.PAPERCLIP_CGROUP_ROOT) throw new Error("No delegated writable cgroup v2 subtree was available (PAPERCLIP_CGROUP_ROOT is not set)");
+  const root = process.env.PAPERCLIP_CGROUP_ROOT;
   const parent = `${root}/paperclip-runs`;
   const directory = `${parent}/${runId}`;
   try {
@@ -346,9 +359,13 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
     if (cgroup) {
       const end = cpuStat(await fs.readFile(`${cgroup.directory}/cpu.stat`, "utf8").catch(() => ""));
       const user = end && end.user !== null && cgroup.start.user !== null ? (end.user - cgroup.start.user) / 1_000_000 : null, system = end && end.system !== null && cgroup.start.system !== null ? (end.system - cgroup.start.system) / 1_000_000 : null, cpu = end ? (end.usage - cgroup.start.usage) / 1_000_000 : null;
-      await releaseCgroupProcesses(cgroup.directory);
+      const rollback = await releaseCgroupProcesses(cgroup.directory);
       await fs.rm(cgroup.directory, { recursive: true, force: true }).catch(() => undefined);
-      result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
+      const removed = await fs.stat(cgroup.directory).then(() => false, () => true);
+      const cleanupWarning = rollback.failed > 0 || !removed
+        ? `cgroup cleanup for run ${runId} at ${cgroup.directory}: ${rollback.failed} member process(es) could not be moved out and may still be confined by its cpu.max; directory ${removed ? "removed" : "could not be removed"}`
+        : undefined;
+      result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "exact_cgroup_v2", userCpuSeconds: user, systemCpuSeconds: system, cpuSeconds: cpu, wallSeconds, ...(cleanupWarning ? { cleanupWarning } : {}), control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: "cgroup_v2", quotaEnforced: true, ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     } else {
       preWindowEntrants += foldProcRowsIntoHighWater(highWater, await collectRows(), false, windowStartTicks);
       const end = highWaterDeltaTotals(highWater), userCpuSeconds = end.user / PROC_TICKS_PER_SECOND, systemCpuSeconds = end.system / PROC_TICKS_PER_SECOND;
