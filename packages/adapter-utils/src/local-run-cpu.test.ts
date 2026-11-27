@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { runChildProcess } from "./server-utils.js";
-import { clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalRunCpuControl, takeLocalRunCpuAccounting, type LocalRunCpuAccounting } from "./local-run-cpu.js";
+import { beginLocalRunCpuAccounting, clearLocalRunCpuControl, configureLocalRunCpuControl, mergeLocalRunCpuAccounting, readLocalRunCpuControl, takeLocalRunCpuAccounting, type LocalRunCpuAccounting } from "./local-run-cpu.js";
 
 describe("local run CPU controls", () => {
   afterEach(() => clearLocalRunCpuControl("cpu-fixture"));
@@ -34,7 +34,18 @@ describe("local run CPU controls", () => {
     const both = takeLocalRunCpuAccounting("cpu-fixture");
     expect(single?.cpuSeconds).toBeGreaterThan(0.1);
     expect(both?.cpuSeconds).toBeGreaterThan((single?.cpuSeconds ?? 0) * 1.5);
-    expect(takeLocalRunCpuAccounting("cpu-fixture")).toBeNull();
+  });
+
+  it("bounds completed accounting retention for runs that never take it", async () => {
+    // Model discovery and failed-before-result executions insert an entry per child process and
+    // never consume it; retention must stay bounded instead of growing for the process lifetime.
+    for (let i = 0; i < 300; i += 1) {
+      const finish = await beginLocalRunCpuAccounting(`cpu-leak-${i}`, process.pid, null);
+      await finish();
+    }
+    expect(takeLocalRunCpuAccounting("cpu-leak-0")).toBeNull(); // evicted once past the bound
+    expect(takeLocalRunCpuAccounting("cpu-leak-299")).not.toBeNull();
+    expect(takeLocalRunCpuAccounting("cpu-leak-299")).toBeNull();
   });
 });
 

@@ -10,6 +10,21 @@ export interface LocalRunCpuAccounting {
 }
 const controls = new Map<string, LocalRunCpuControl>();
 const completed = new Map<string, LocalRunCpuAccounting>();
+// Bounded retention: callers that never take their accounting (model discovery, processes that
+// fail before result handling) would otherwise grow this map for the life of the process. Real
+// heartbeat consumers take their entry promptly after the run ends, so evicting the oldest entry
+// past a generous bound loses nothing they would have read.
+const COMPLETED_ACCOUNTING_LIMIT = 256;
+function rememberCompleted(runId: string, accounting: LocalRunCpuAccounting) {
+  if (!completed.has(runId)) {
+    while (completed.size >= COMPLETED_ACCOUNTING_LIMIT) {
+      const oldest = completed.keys().next().value;
+      if (oldest === undefined) break;
+      completed.delete(oldest);
+    }
+  }
+  completed.set(runId, accounting);
+}
 const PROC_TICKS_PER_SECOND = 100;
 function numberInRange(value: unknown, min: number, max: number) { return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= min && value <= max ? value : null; }
 export function readLocalRunCpuControl(runtimeConfig: unknown): LocalRunCpuControl | null {
@@ -98,6 +113,6 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
       result = { schema: "paperclip.local_run_cpu.v1", scope: "local_process_tree", quality: "approximate_proc_group", userCpuSeconds, systemCpuSeconds, cpuSeconds: userCpuSeconds + systemCpuSeconds, wallSeconds, control: { requestedQuotaPercent: requested.quotaPercent, requestedNice: requested.nice, method: appliedNice !== undefined ? "nice" : "none", quotaEnforced: false, ...(fallbackReason ? { fallbackReason } : requested.quotaPercent !== null ? { fallbackReason: "No delegated writable cgroup v2 subtree was available" } : {}), ...(appliedNice !== undefined ? { appliedNice } : {}) } };
     }
     const merged = mergeLocalRunCpuAccounting(completed.get(runId) ?? null, result);
-    completed.set(runId, merged); return merged;
+    rememberCompleted(runId, merged); return merged;
   };
 }
