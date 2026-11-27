@@ -106,10 +106,14 @@ async function procStats() {
   }));
   return stats.filter(stat => stat !== null);
 }
-async function bootTimeSeconds() {
+// The sampling window start in kernel ticks, from /proc/uptime: the same boot-relative clock
+// basis as /proc/<pid>/stat starttime. /proc/stat btime cannot be used: it is truncated to whole
+// seconds, which can place a computed boundary almost a second ahead of the kernel tick timeline
+// and misclassify brand-new processes as pre-existing.
+async function kernelUptimeTicks() {
   if (process.platform !== "linux") return null;
-  const btime = Number(/\bbtime (\d+)/.exec(await fs.readFile("/proc/stat", "utf8").catch(() => ""))?.[1]);
-  return Number.isFinite(btime) ? btime : null;
+  const uptime = Number((await fs.readFile("/proc/uptime", "utf8").catch(() => "")).trim().split(/\s+/)[0]);
+  return Number.isFinite(uptime) ? uptime * PROC_TICKS_PER_SECOND : null;
 }
 async function processGroupRows(processGroupId: number) {
   return (await procStats()).filter(sample => sample.pgrp === processGroupId);
@@ -130,16 +134,17 @@ async function processTreeRows(rootPid: number) {
 }
 
 export type HighWaterEntry = { baselineUser: number; baselineSystem: number; maxUser: number; maxSystem: number };
-const IDENTITY_WINDOW_SLACK_TICKS = 10;
 // Fold one sampling round into the high-water map; returns the number of newly seen identities
 // flagged as pre-window entrants. Identity is pid + kernel starttime, so a recycled pid starts a
 // fresh entry. baselinedNew is true only for the begin sample: identities observed then may have
 // pre-window CPU (a reused warm process), which is subtracted at finish. An identity first seen
 // in a later sample is not proven born inside the window (a pre-existing process can enter the
 // sampled set, e.g. by reparenting), so its kernel starttime is compared with the window start:
-// born at/after the window start -> counts from zero; older, or undecidable -> its first-observed
-// value becomes the baseline so pre-window CPU is not charged to this run, and the entrant is
-// flagged for unmeasuredPriorCpuProcesses because that prior CPU is unknown, not measured.
+// born at/after the (rounded-up) window start -> counts from zero; older, boundary-adjacent, or
+// undecidable -> its first-observed value becomes the baseline so pre-window CPU is not charged
+// to this run, and the entrant is flagged for unmeasuredPriorCpuProcesses because that prior CPU
+// is unknown, not measured. No downward slack: a process that started even one tick before the
+// window takes the flagged conservative path rather than being classified as definitively new.
 export function foldProcRowsIntoHighWater(highWater: Map<string, HighWaterEntry>, rows: Array<{ pid: number; user: number; system: number; starttime: number }>, baselinedNew: boolean, windowStartTicks: number | null) {
   let preWindowEntrants = 0;
   for (const row of rows) {
@@ -149,7 +154,7 @@ export function foldProcRowsIntoHighWater(highWater: Map<string, HighWaterEntry>
       prev.maxUser = Math.max(prev.maxUser, row.user);
       prev.maxSystem = Math.max(prev.maxSystem, row.system);
     } else {
-      const bornInWindow = windowStartTicks !== null && Number.isFinite(row.starttime) && row.starttime >= windowStartTicks - IDENTITY_WINDOW_SLACK_TICKS;
+      const bornInWindow = windowStartTicks !== null && Number.isFinite(row.starttime) && row.starttime >= windowStartTicks;
       const baselined = baselinedNew || !bornInWindow;
       if (!baselinedNew && !bornInWindow) preWindowEntrants += 1;
       highWater.set(key, {
@@ -218,8 +223,10 @@ export async function beginLocalRunCpuAccounting(runId: string, pid: number, pro
   // Measured sampling limitations (not guaranteed bounds): a process that starts and exits
   // entirely between two samples is never observed; a process reparented out of the tree stops
   // being matched.
-  const boot = await bootTimeSeconds();
-  const windowStartTicks = boot === null ? null : (Date.now() / 1_000 - boot) * PROC_TICKS_PER_SECOND;
+  // Round the window start up so fractional-tick truncation cannot classify a just-pre-window
+  // process as born in-window.
+  const uptimeTicks = await kernelUptimeTicks();
+  const windowStartTicks = uptimeTicks === null ? null : Math.ceil(uptimeTicks);
   let preWindowEntrants = 0;
   const collectRows = processGroupId ? () => processGroupRows(processGroupId) : () => processTreeRows(pid);
   const highWater = new Map<string, HighWaterEntry>();

@@ -135,6 +135,10 @@ describe("local run CPU controls", () => {
     expect(foldProcRowsIntoHighWater(highWater, [row(9, 1000, 430, 44)], false, 5000)).toBe(0); // +30/+4 in-window
     expect(foldProcRowsIntoHighWater(highWater, [row(10, 5001, 20, 2)], false, 5000)).toBe(0);  // born in-window
     expect(highWaterDeltaTotals(highWater)).toEqual({ user: 50, system: 6 });
+    // Boundary: one tick before the window start is already pre-existing, never "definitively new".
+    expect(foldProcRowsIntoHighWater(highWater, [row(12, 4999, 700, 70)], false, 5000)).toBe(1);
+    expect(foldProcRowsIntoHighWater(highWater, [row(12, 4999, 705, 71)], false, 5000)).toBe(0);
+    expect(highWaterDeltaTotals(highWater)).toEqual({ user: 55, system: 7 });
     // Undecidable origin (no window reference) is also baselined and flagged, never assumed new.
     const blind = new Map<string, import("./local-run-cpu.js").HighWaterEntry>();
     expect(foldProcRowsIntoHighWater(blind, [row(11, 42, 90, 9)], false, null)).toBe(1);
