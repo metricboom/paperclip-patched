@@ -153,6 +153,43 @@ describe.each([{ label: "git-backed", withGit: true }, { label: "plain", withGit
   },
 );
 
+describe("SSH sync of a committed heavy folder in a git workspace", () => {
+  // Known limit: tracked files come from the git checkout on the remote, so a
+  // committed vendor/ is materialized there. Deleting it would show up as a
+  // tracked deletion an agent could commit, so it is left alone. The tar
+  // overlay and the restore still skip it, so local files are never touched.
+  it("leaves the local copy untouched whatever the remote does to it", async (context) => {
+    const env = await setup();
+    if (!env) { context.skip(); return; }
+    const localDir = path.join(env.rootDir, "local");
+    await mkdir(path.join(localDir, "vendor"), { recursive: true });
+    await writeFile(path.join(localDir, "vendor", "lib.js"), "committed\n");
+    await writeFile(path.join(localDir, "keep.txt"), "keep\n");
+    await git(localDir, ["init"]);
+    await git(localDir, ["checkout", "-b", "main"]);
+    await git(localDir, ["config", "user.name", "t"]);
+    await git(localDir, ["config", "user.email", "t@example.test"]);
+    await git(localDir, ["add", "."]);
+    await git(localDir, ["commit", "-m", "init"]);
+    await writeFile(path.join(localDir, "vendor", "lib.js"), "local dirty\n");
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: env.spec, runId: "vendor", adapterKey: "test-adapter", workspaceLocalDir: localDir,
+    });
+    cleanups.push(() => prepared.restoreWorkspace());
+    const remoteVendor = path.posix.join(prepared.workspaceRemoteDir, "vendor/lib.js");
+    // The checkout brings the committed content, not the local dirty edit.
+    expect((await runSshCommand(env.spec, `cat ${shellQuote(remoteVendor)}`)).stdout).toBe("committed\n");
+    await runSshCommand(env.spec, `echo remote > ${shellQuote(remoteVendor)} && echo new > ${shellQuote(path.posix.join(prepared.workspaceRemoteDir, "new.txt"))}`);
+
+    await prepared.restoreWorkspace();
+    cleanups.length = 0;
+    cleanups.push(async () => { await stopSshEnvLabFixture(env.state); await rm(env.rootDir, { recursive: true, force: true }); });
+    expect(await readFile(path.join(localDir, "vendor", "lib.js"), "utf8")).toBe("local dirty\n");
+    expect(await readFile(path.join(localDir, "new.txt"), "utf8")).toBe("new\n");
+  }, TIMEOUT_MS);
+});
+
 describe("SSH restore without a baseline", () => {
   it("keeps local heavy folders that were never sent", async (context) => {
     const env = await setup();
