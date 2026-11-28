@@ -16,6 +16,7 @@ import {
   readSanitizedOriginRemoteUrl,
   resetLocalGitIndexToHead,
 } from "./git-workspace-sync.js";
+import { shouldExcludePath, WORKSPACE_HEAVY_DIR_EXCLUDES } from "./exclude-patterns.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 
@@ -649,15 +650,30 @@ async function runSshScript(
 async function clearLocalDirectory(
   localDir: string,
   preserveEntries: string[] = [],
+  keepExcluded: readonly string[] = [],
 ): Promise<void> {
   await fs.mkdir(localDir, { recursive: true });
   const preserve = new Set(preserveEntries);
-  const entries = await fs.readdir(localDir);
-  await Promise.all(
-    entries
-      .filter((entry) => !preserve.has(entry))
-      .map((entry) => fs.rm(path.join(localDir, entry), { recursive: true, force: true })),
-  );
+  // Entries matching `keepExcluded` were never transferred, so their absence
+  // from the staging copy is not a deletion. Walk down only to find them.
+  const clearDir = async (dir: string, relative: string): Promise<void> => {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    await Promise.all(entries.map(async (entry) => {
+      const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      if (!relative && preserve.has(entry.name)) return;
+      const full = path.join(dir, entry.name);
+      if (keepExcluded.length > 0 && shouldExcludePath(entryRelative, keepExcluded)) return;
+      if (keepExcluded.length > 0 && entry.isDirectory()) {
+        await clearDir(full, entryRelative);
+        await fs.rmdir(full).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error;
+        });
+        return;
+      }
+      await fs.rm(full, { recursive: true, force: true });
+    }));
+  };
+  await clearDir(localDir, "");
 }
 
 async function copyDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
@@ -1690,6 +1706,8 @@ export async function syncDirectoryFromSsh(input: {
   localDir: string;
   exclude?: string[];
   preserveLocalEntries?: string[];
+  /** Keep local entries that match `exclude`: they were not transferred. */
+  keepExcludedLocal?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
@@ -1814,7 +1832,7 @@ export async function syncDirectoryFromSsh(input: {
     });
     await progress?.finish();
 
-    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
+    await clearLocalDirectory(input.localDir, input.preserveLocalEntries, input.keepExcludedLocal ? input.exclude ?? [] : []);
     await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
     await progress?.fail();
@@ -1834,6 +1852,9 @@ export async function prepareWorkspaceForSshExecution(input: {
   workspaceExclude?: string[];
 }): Promise<{ gitBacked: boolean; repositories?: string[]; excludedPaths?: string[] }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
+  // "all" mode is the explicit full copy; every other mode skips package and
+  // build folders in both directions.
+  const heavyExcludes = input.workspaceFileMode === "all" ? [] : WORKSPACE_HEAVY_DIR_EXCLUDES;
   const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
   const excludedPaths = await listProjectRepositoryStagingPaths(input.localDir);
   const excludedResult = excludedPaths.length > 0 ? { excludedPaths } : {};
@@ -1845,7 +1866,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       localDir: input.localDir,
       remoteDir,
       snapshot: gitSnapshot,
-      exclude: repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : excludedPaths,
+      exclude: [...(repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : excludedPaths), ...heavyExcludes],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1861,6 +1882,7 @@ export async function prepareWorkspaceForSshExecution(input: {
         localDir,
         remoteDir: path.posix.join(remoteDir, relative),
         snapshot,
+        exclude: heavyExcludes,
         onProgress: input.onProgress,
         progressLabel: relative,
       });
@@ -1877,7 +1899,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime", ...excludedPaths, ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+    exclude: [".paperclip-runtime", ...excludedPaths, ...heavyExcludes, ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -2018,8 +2040,9 @@ async function restoreWorkspaceRootFromSsh(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime", ...projectRepositoryEntries],
+      exclude: [".git", ".paperclip-runtime", ...projectRepositoryEntries, ...WORKSPACE_HEAVY_DIR_EXCLUDES],
       preserveLocalEntries: [".git", ...projectRepositoryEntries],
+      keepExcludedLocal: true,
       onProgress: input.onProgress,
       progressLabel: input.progressLabel,
     });
@@ -2030,7 +2053,8 @@ async function restoreWorkspaceRootFromSsh(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...WORKSPACE_HEAVY_DIR_EXCLUDES],
+    keepExcludedLocal: true,
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });

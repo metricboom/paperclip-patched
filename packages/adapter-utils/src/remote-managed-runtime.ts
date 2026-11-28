@@ -13,6 +13,7 @@ import {
   type SandboxAdditionalSource,
   type SandboxManagedRuntimeAssetRestoreContext,
 } from "./sandbox-managed-runtime.js";
+import { WORKSPACE_HEAVY_DIR_EXCLUDES } from "./exclude-patterns.js";
 import { captureDirectorySnapshot, type DirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
 
@@ -171,6 +172,9 @@ export async function prepareRemoteManagedRuntime(input: {
       })
     : null;
   const projectRepositories = preparedWorkspace?.repositories ?? [];
+  // The baseline must skip the same folders the transfer skips, so a folder
+  // that never reached the remote is not read as deleted on restore.
+  const heavyExcludes = input.workspaceFileMode === "all" ? [] : WORKSPACE_HEAVY_DIR_EXCLUDES;
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
@@ -178,8 +182,9 @@ export async function prepareRemoteManagedRuntime(input: {
               ...GIT_ARCHIVE_EXCLUDES,
               ".paperclip-runtime",
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : preparedWorkspace.excludedPaths ?? []),
+              ...heavyExcludes,
             ]
-          : [".paperclip-runtime", ...(preparedWorkspace.excludedPaths ?? []), ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          : [".paperclip-runtime", ...(preparedWorkspace.excludedPaths ?? []), ...heavyExcludes, ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
       })
     : null;
   const repositoryBaselines: Array<{ path: string; baselineSnapshot: DirectorySnapshot }> = [];
@@ -187,7 +192,7 @@ export async function prepareRemoteManagedRuntime(input: {
     repositoryBaselines.push({
       path: repository,
       baselineSnapshot: await captureDirectorySnapshot(path.join(input.workspaceLocalDir, repository), {
-        exclude: [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"],
+        exclude: [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...heavyExcludes],
       }),
     });
   }

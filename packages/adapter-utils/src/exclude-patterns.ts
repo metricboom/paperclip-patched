@@ -1,3 +1,27 @@
+/**
+ * Package and build folders that are never staged to a remote workspace and
+ * never treated as deleted on restore. Shared by the sandbox and SSH paths.
+ * (Ported approach from upstream paperclipai/paperclip#18155.)
+ */
+export const WORKSPACE_HEAVY_DIR_NAMES = [
+  "node_modules",
+  "vendor",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  ".next",
+  ".turbo",
+  ".cache",
+] as const;
+
+export const WORKSPACE_HEAVY_DIR_EXCLUDES: string[] = WORKSPACE_HEAVY_DIR_NAMES.flatMap((entry) => [
+  entry,
+  `${entry}/*`,
+  `*/${entry}`,
+  `*/${entry}/*`,
+]);
+
 export function isRelativePathOrDescendant(relative: string, candidate: string): boolean {
   return relative === candidate || relative.startsWith(`${candidate}/`);
 }

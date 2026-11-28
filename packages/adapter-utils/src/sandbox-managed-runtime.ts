@@ -55,7 +55,7 @@ import {
   type RuntimeStatusPhase,
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
-import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { isRelativePathOrDescendant, shouldExcludePath, WORKSPACE_HEAVY_DIR_EXCLUDES } from "./exclude-patterns.js";
 import {
   scheduleSyncOperations,
   SYNC_OPERATION_CONCURRENCY_LIMIT,
@@ -68,23 +68,7 @@ import {
 } from "./workspace-restore-diagnostics.js";
 
 const execFile = promisify(execFileCallback);
-const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
-  "node_modules",
-  "vendor",
-  "dist",
-  "build",
-  "out",
-  "coverage",
-  ".next",
-  ".turbo",
-  ".cache",
-] as const;
-const SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES = SANDBOX_WORKSPACE_HEAVY_DIR_NAMES.flatMap((entry) => [
-  entry,
-  `${entry}/*`,
-  `*/${entry}`,
-  `*/${entry}/*`,
-]);
+const SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES = WORKSPACE_HEAVY_DIR_EXCLUDES;
 
 export interface SandboxRemoteExecutionSpec {
   transport: "sandbox";
